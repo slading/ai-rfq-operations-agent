@@ -1,0 +1,127 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rfq-agent"
+version = "0.1.0"
+description = "AI RFQ Operations Agent - agentic B2B RFQ processing with deterministic business logic and human approval"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    # Phase 1A: synchronous SQLAlchemy 2.0 on SQLite, schema managed by Alembic.
+    # Both are pinned to the 2.x / 1.x lines the typed models and the generated
+    # migration were written against.
+    "sqlalchemy>=2.0,<2.2",
+    "alembic>=1.13,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rfq_agent = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# Lint / format (ruff is both linter and formatter for this project)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = [
+    "A",      # flake8-builtins
+    "ANN",    # flake8-annotations
+    "ARG",    # flake8-unused-arguments
+    "B",      # flake8-bugbear
+    "BLE",    # flake8-blind-except
+    "C4",     # flake8-comprehensions
+    "D",      # pydocstyle
+    "DTZ",    # flake8-datetimez
+    "E", "W", # pycodestyle
+    "ERA",    # eradicate (commented-out code)
+    "F",      # pyflakes
+    "FA",     # flake8-future-annotations
+    "I",      # isort
+    "ICN",    # flake8-import-conventions
+    "N",      # pep8-naming
+    "PERF",   # perflint
+    "PGH",    # pygrep-hooks
+    "PIE",    # flake8-pie
+    "PL",     # pylint
+    "PT",     # flake8-pytest-style
+    "PYI",    # flake8-pyi
+    "RET",    # flake8-return
+    "RSE",    # flake8-raise
+    "RUF",    # ruff-specific
+    "S",      # flake8-bandit
+    "SIM",    # flake8-simplify
+    "SLF",    # flake8-self
+    "T10",    # flake8-debugger
+    "T20",    # flake8-print
+    "TID",    # flake8-tidy-imports
+    "UP",     # pyupgrade
+]
+ignore = [
+    "ANN401",  # dynamically typed **kwargs / Json payloads are intentional in contracts
+    # flake8-type-checking is deliberately not enabled: the domain schemas are
+    # pydantic models, whose annotations must be resolvable at runtime. Moving
+    # them into TYPE_CHECKING blocks breaks model construction (verified the hard
+    # way in Phase 0), so runtime imports are the correct style here.
+    "D107",    # exception/test-double __init__ signatures are self-evident
+    "COM812",  # trailing commas are the formatter's job
+    "D203",    # incompatible with D211
+    "D212",    # multi-line summary starts on the second line (D213)
+    "ISC001",  # conflicts with the formatter
+    "PLR0911", # transition/validation tables legitimately have many returns
+    "PLR0913", # pydantic models take many keyword fields by design
+    "S101",    # assert is the correct tool inside tests
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN", "PLR2004", "SLF001"]
+"**/__init__.py" = ["D104"]
+# A command-line entry point exists to write to the terminal: `print` is the
+# interface, not a debugging leftover.
+"**/__main__.py" = ["T201"]
+# Migration revisions are DDL, not prose: constraint expressions are long SQL
+# string literals the formatter cannot wrap, and one upgrade() legitimately runs
+# past 50 statements. Everything else (imports, annotations, docstrings) is
+# still enforced, so a broken revision fails lint like any other module.
+"migrations/**" = ["E501", "PLR0915"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rfq_agent"]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `src` is added to sys.path so a bare `pytest` works without an editable
+# install; `make install` is still the supported setup for development.
+pythonpath = ["src"]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
+markers = [
+    "live: tests that call the real Groq API (never run in CI; opt-in only)",
+]

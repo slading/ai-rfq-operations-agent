@@ -1,0 +1,165 @@
+# AI RFQ Operations Agent
+
+An agentic B2B RFQ (request-for-quotation) processing system. Unstructured
+customer requests go in; verified, approval-ready quotations come out.
+
+The LLM interprets and orchestrates. It never invents prices, stock, SKUs,
+customer records, totals or delivery dates — those come from deterministic tools
+and business data, and every consequential action requires a human.
+
+## Status
+
+**Phase 0 — skeleton & contracts.** Schemas, enums, value objects, the workflow
+state machine contract and the provider-neutral interfaces.
+
+**Phase 1A — persistence.** SQLite through synchronous SQLAlchemy 2.0, with the
+schema versioned by Alembic: 25 tables, append-only audit triggers, and the run
+state machine enforced by the database itself. Migrations are the only way a
+schema is created — there is no `create_all()` in production code.
+
+**Phase 1B — demo dataset.** The Northwind Components business data: product
+families, catalogue, customers and aliases, price books, stock, carriers and a
+holiday calendar, applied by one deterministic, idempotent seed command.
+
+**Phase 1C — read boundary.** The read repositories through which the rest of
+the system sees business data. Callers receive domain value objects or explicit
+read models — never SQLAlchemy rows — with money, enums, dates and UTC instants
+converted explicitly at the seam. Reads report what the data says and decide
+nothing: an ambiguous part number comes back as two matches, an expired price
+entry comes back like any other, and no price is preferred over another.
+
+**Phase 1D — pricing resolution.** The deterministic rule that turns the stored
+price entries for one already-resolved product into a single applied price:
+customer contract price, then tier price, then the public list tier; then the
+highest reachable quantity break, the latest start date, and finally the entry
+id, which makes the order total. Validity windows and quantity thresholds are
+honoured exactly, an expired entry is never used, another customer's contract is
+never offered and nothing is converted or invented. Every outcome is explicit: a
+found price with its entry id as provenance, or `MISSING` / `EXPIRED` with a
+machine-readable reason.
+
+**Phase 1E — stock availability.** The deterministic answer to "can we cover
+this quantity": unreserved stock (`on_hand − reserved`) is the only thing that
+counts, inbound shipments are reported but never counted, and the outcome is
+`SUFFICIENT` / `PARTIAL` / `NONE` with a machine-readable reason when the request
+is not covered. A warehouse that can cover the request alone is reported as a
+fact; when only the combined stock covers it, that is stated with a split
+proposal as data — no shipping decision is made, nothing is reserved, and stale
+or future-dated stock facts are reported rather than silently trusted.
+
+**Phase 1F — delivery and calendar.** The earliest ship and delivery dates for a
+request stock covers, computed from the carrier services and the seeded holiday
+calendar: the cut-off hour decides whether an order leaves today, transit is
+counted in working days, weekends are skipped unless the service runs on them,
+and a public holiday stops the clock in the origin *or* the destination country.
+A request covered by two warehouses is scheduled leg by leg and the later leg
+sets the promise — reported as data, with no shipping decision attached. When a
+fact is missing (no carrier, an unknown destination country, a country outside
+the loaded calendar) the answer is `UNKNOWN` and no date at all, never a guess.
+
+**Phase 1G — discount rules.** Which single discount rule applies to a quotation
+is a lookup, not a negotiation: the seeded rules document the order (highest
+priority, then the narrowest scope — customer, then tier, then everyone), and the
+code follows it. Applicability is decided before precedence, so a switched-off,
+out-of-window or below-floor rule at a higher precedence never blocks a lower one;
+the rate is never a tie-break, and the rule id settles a total order. A rule
+whose rate is zero is an applied rule, and a rule that needs sign-off is selected
+and reported as such — this phase names the rule and the rate, and no percentage
+touches money here.
+
+**Phase 1H — quote arithmetic.** The money: every line is extended as
+`quantity × unit_price` and quantised to cents with half-up rounding, the
+subtotal is the sum of the extensions, the selected rule's percentage is applied
+to that subtotal, and `total = subtotal − discount_amount`. All of it is exact
+`Decimal` — no float ever touches a price. Every amount keeps its provenance:
+the price entry id on the line, the rule id, scope and rate on the quote, plus
+the calculation version and a fingerprint of the inputs, so the same facts always
+produce the same money and the same digest. A line whose price lookup did not
+return `FOUND` gets no price and no amount: it is blocked, machine-readably, it
+is never totalled, and the quote that contains it can never be sent. The
+calculator applies the discount it is given, reports `requires_approval` as a
+fact, and decides nothing — no gate, no approval, no write.
+
+**Phase 1I — the blocking ledger.** Why a quotation cannot go out is a fact, not
+a summary written by a model. The projection takes what the calculation already
+established — which lines priced, what each line's stock position is, what the
+delivery promise says, whether the selected rule needed sign-off, and whether the
+customer is on credit hold — and turns it into the ledger the contract already
+defined: a machine-readable code, a sentence an operator can act on, and the
+offending line where there is one. Five facts map onto five codes and nothing
+else is invented: an un-priced line is `PRICE_MISSING`, a stock status the
+contract calls blocking is `STOCK_INSUFFICIENT`, a promise that is infeasible *or
+unknown* is `DELIVERY_INFEASIBLE`, a rule that exceeds the delegated limit is
+`DISCOUNT_OVER_POLICY`, and a credit hold is `CREDIT_HOLD`. Unknown is never
+softened into "probably fine" and stale is never relabelled — it is reported as
+what it is, by the same wording the gate uses. Entries are deduplicated by code
+(the contract's gate input refuses duplicate codes) with the per-line detail kept
+on the line, ordered by the contract's own code order, and identical facts always
+produce an identical ledger. Nothing is approved, rejected or transitioned: this
+projects the reasons a human will see, and gives them nothing to argue with.
+
+No provider calls, agent loop, worker, write path or UI yet.
+
+The approved V1 design (state machine, failure model, trust boundary, evaluation
+strategy) is not committed yet — it lands as `docs/ARCHITECTURE.md` alongside the
+Phase 1 work. Until then the schemas in `src/rfq_agent/domain/` are the
+authoritative statement of the contract, and `src/rfq_agent/domain/workflow.py`
+holds the state machine as data.
+
+## Setup
+
+```bash
+make venv PYTHON_VERSION=3.13   # or: python3 -m venv .venv
+make install
+```
+
+## Checks
+
+```bash
+make lint    # ruff check + ruff format --check
+make test    # pytest (offline only)
+make check   # both - the phase exit check
+```
+
+`make` always uses `.venv`. A bare `pytest` also works from the repo root:
+`[tool.pytest.ini_options].pythonpath = ["src"]` puts the package on `sys.path`,
+provided the interpreter running pytest has `pydantic` and `pydantic-settings`
+installed (`pip install -e ".[dev]"` does that).
+
+Live Groq tests are opt-in and never run by `make test`:
+
+```bash
+.venv/bin/pytest -m live
+```
+
+## Demo data
+
+```bash
+make migrate      # alembic upgrade head — creates var/rfq_agent.db
+make seed         # write the Northwind Components dataset (idempotent)
+make seed-reset   # delete the dataset's rows and write them again from scratch
+```
+
+The dataset is literals in `src/rfq_agent/seed/dataset.py`, versioned by
+`SEED_VERSION`, and deliberately not generated: no clock, no randomness, no
+streaming from a remote source. `make seed` *converges* the database to the
+dataset — a missing row is inserted, a row edited by hand is corrected, a row
+that is not part of the dataset is left alone — and reports what it did.
+`make seed-reset` is the local-development path: it deletes exactly the dataset's
+rows, children before parents, then writes them again, and refuses (rather than
+cascading) if business records such as quotations reference them.
+
+Contents: 3 product families, 18 products, 8 customers with aliases, 2 warehouses
+(Warsaw and Berlin), 2 price books — a public list and negotiated contracts —
+27 price entries, 6 discount rules, 27 stock rows, 4 carrier services, and the
+2026 public-holiday calendar for the seven countries involved. Currency is EUR
+throughout and there is no tax logic. A few rows exist on purpose to make the
+hard cases demonstrable: a discontinued product whose only price has expired, a
+contract-only item with no list price, a customer on credit hold, a deactivated
+account, a stock line with nothing available but stock inbound, and one part
+number that genuinely resolves to two products.
+
+## Configuration
+
+Copy `.env.example` to `.env`. Every variable is prefixed `RFQ_`; nested
+sections use `__` (e.g. `RFQ_GROQ__AGENT_MODEL`).

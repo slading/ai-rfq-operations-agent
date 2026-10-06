@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- Secrets & local config (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Application data (Phase 1+) ---
+*.db
+*.db-wal
+*.db-shm
+var/
+data/*.sqlite3
+
+# --- Groq request recordings (may contain untrusted customer content) ---
+recordings/
+eval/results/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
