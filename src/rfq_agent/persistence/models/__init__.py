@@ -40,7 +40,11 @@ from rfq_agent.persistence.models.pricing import (
     PriceBookRow,
     PriceEntryRow,
 )
-from rfq_agent.persistence.models.quote import QuoteLineRow, QuoteRow
+from rfq_agent.persistence.models.quote import (
+    QuoteBlockedReasonRow,
+    QuoteLineRow,
+    QuoteRow,
+)
 from rfq_agent.persistence.models.rfq import (
     IntakeEventRow,
     RfqAttachmentRow,
@@ -70,6 +74,7 @@ __all__ = [
     "ProductAliasRow",
     "ProductFamilyRow",
     "ProductRow",
+    "QuoteBlockedReasonRow",
     "QuoteLineRow",
     "QuoteRow",
     "RfqAttachmentRow",

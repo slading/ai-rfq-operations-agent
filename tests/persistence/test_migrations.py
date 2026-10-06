@@ -85,7 +85,7 @@ def test_upgrade_from_empty_database_creates_every_model_table(
         migrated = set(inspect(connection).get_table_names()) - _INTERNAL_TABLES
 
     assert migrated == set(Base.metadata.tables)
-    assert len(migrated) == 25
+    assert len(migrated) == 26
 
 
 def test_no_drift_between_models_and_migrations(connection: Connection) -> None:
@@ -165,11 +165,12 @@ def test_head_revision_is_single_and_linear(empty_config: Config) -> None:
     script = ScriptDirectory.from_config(empty_config)
 
     heads = script.get_heads()
-    assert heads == ["0001"]
+    assert heads == ["0002"]
 
     revisions = list(script.walk_revisions())
-    assert len(revisions) == 1
-    assert revisions[0].down_revision is None
+    assert [revision.revision for revision in revisions] == ["0002", "0001"]
+    assert revisions[0].down_revision == "0001"
+    assert revisions[-1].down_revision is None
 
 
 def test_offline_mode_emits_sql_without_connecting(empty_config: Config, empty_path: Path) -> None:
@@ -195,7 +196,7 @@ def test_version_table_records_the_applied_revision(
     with empty_engine.connect() as connection:
         applied = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
 
-    assert applied == "0001"
+    assert applied == "0002"
 
 
 def test_shared_test_schema_matches_a_freshly_migrated_one(

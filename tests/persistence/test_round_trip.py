@@ -2,7 +2,7 @@
 
 The persistence layer's job is to be boring: what the domain hands it is what the
 domain gets back, byte for byte where bytes matter. These tests insert a full
-graph covering **all 25 tables**, then compare what was written against what a
+graph covering **all 26 tables**, then compare what was written against what a
 fresh read returns - every mapped attribute, not a chosen few. That is
 deliberately unsubtle: a column whose type quietly rounds, truncates or
 reinterprets its value is exactly the kind of defect that surfaces months later
@@ -35,7 +35,7 @@ from rfq_agent.contracts.llm import ModelPurpose
 from rfq_agent.domain.human import HumanActionKind
 from rfq_agent.domain.intake import IntakeEventKind
 from rfq_agent.domain.outbound import OutboundStatus
-from rfq_agent.domain.policy import DiscountScope
+from rfq_agent.domain.policy import BlockedReasonCode, DiscountScope
 from rfq_agent.domain.workflow import RunState, TransitionEvent
 from rfq_agent.observability.spans import ToolResultStatus
 from rfq_agent.persistence.base import Base
@@ -49,6 +49,7 @@ from rfq_agent.persistence.models import (
     LlmCallRow,
     PriceEntryRow,
     ProductAliasRow,
+    QuoteBlockedReasonRow,
     QuoteLineRow,
     QuoteRow,
     RfqAttachmentRow,
@@ -171,6 +172,25 @@ def _queue_entry() -> Base:
     )
 
 
+def _blocked_reason(core: Core) -> Base:
+    """One reason a quote cannot go out, as the projection writes it.
+
+    It hangs off the quote rather than off master data, so it is inserted with
+    the leaves - after the ``quotes`` row it belongs to exists.
+    """
+    return QuoteBlockedReasonRow(
+        quote_id=core.quote_id,
+        seq=1,
+        run_id=core.run_id,
+        code=BlockedReasonCode.PRICE_MISSING,
+        message="line 1 (PMP-D-300) has no usable price: the only price entry expired.",
+        line_ordinal=1,
+        resolvable_by_human=True,
+        flags_json=[],
+        created_at=NOW,
+    )
+
+
 def _idempotency_claim() -> Base:
     """The claim that backs ``contracts.ports.IdempotencyStore``."""
     return IdempotencyClaimRow(
@@ -280,7 +300,7 @@ def _sample(session: Session, core: Core) -> list[Base]:
     session.flush()
     rows.append(quote)
 
-    leaves: list[Base] = [quote_line_row(core), outbound_row(core)]
+    leaves: list[Base] = [_blocked_reason(core), quote_line_row(core), outbound_row(core)]
     session.add_all(leaves)
     session.flush()
     rows.extend(leaves)

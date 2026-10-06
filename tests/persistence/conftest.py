@@ -6,7 +6,7 @@ can only ever agree with the models, so a test suite using it would silently
 stop checking the thing that actually runs in production - the migrations.
 
 The schema is migrated once per session into a template file, then copied per
-test. Copying a small SQLite file is far cheaper than replaying 25 ``CREATE
+test. Copying a small SQLite file is far cheaper than replaying 26 ``CREATE
 TABLE`` statements for every test, and keeps each test fully isolated.
 """
 

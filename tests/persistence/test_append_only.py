@@ -21,8 +21,9 @@ from sqlalchemy.orm import Session
 from rfq_agent.domain.human import HumanActionKind
 from rfq_agent.domain.intake import IntakeEventKind
 from rfq_agent.domain.outbound import OutboundStatus
+from rfq_agent.domain.policy import BlockedReasonCode
 from rfq_agent.domain.workflow import ReasonCode
-from rfq_agent.persistence.models import IntakeEventRow, RunEventRow
+from rfq_agent.persistence.models import IntakeEventRow, QuoteBlockedReasonRow, RunEventRow
 from tests.persistence.factories import (
     NOW,
     Core,
@@ -77,6 +78,56 @@ _APPEND_ONLY_STATEMENTS = [
     ("human_actions", "UPDATE human_actions SET actor = 'someone-else'"),
     ("human_actions", "DELETE FROM human_actions"),
 ]
+
+
+def _seed_a_ledger_row(session: Session, core: Core) -> None:
+    """A quote and one ledger reason, so that table's triggers have something to bite.
+
+    It needs the ``core`` fixture rather than the audit rows above, because the
+    ledger hangs off a quotation - and a quotation needs the reference graph.
+    """
+    session.add(quote_row(core))
+    session.commit()
+
+    session.add(
+        QuoteBlockedReasonRow(
+            quote_id=core.quote_id,
+            seq=1,
+            run_id=core.run_id,
+            code=BlockedReasonCode.PRICE_MISSING,
+            message="line 1 has no usable price",
+            line_ordinal=1,
+            resolvable_by_human=True,
+            flags_json=[],
+            created_at=NOW,
+        )
+    )
+    session.commit()
+
+
+#: The blocking ledger (Phase 1J') is append-only for the same reason: it is the
+#: evidence a human acts on, so it may be added to but never rewritten.
+_LEDGER_STATEMENTS = [
+    (
+        "quote_blocked_reasons",
+        "UPDATE quote_blocked_reasons SET message = 'rewritten' WHERE seq = 1",
+    ),
+    ("quote_blocked_reasons", "DELETE FROM quote_blocked_reasons"),
+]
+
+
+@pytest.mark.parametrize(
+    ("table", "statement"),
+    _LEDGER_STATEMENTS,
+    ids=[f"{table}:{statement.split()[0]}" for table, statement in _LEDGER_STATEMENTS],
+)
+def test_the_blocking_ledger_refuses_updates_and_deletes(
+    session: Session, core: Core, table: str, statement: str
+) -> None:
+    """A reason a reviewer is acting on must not be quietly editable."""
+    _seed_a_ledger_row(session, core)
+
+    _refuse(session, statement, f"{table} is append-only")
 
 
 @pytest.mark.parametrize(

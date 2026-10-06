@@ -5,7 +5,11 @@ The public surface of this package is small on purpose:
 * :class:`~rfq_agent.persistence.engine.Database` - engine plus session factory;
 * :class:`~rfq_agent.persistence.base.Base` - declarative base and metadata;
 * the ``*Row`` models, imported through
-  :mod:`rfq_agent.persistence.models`.
+  :mod:`rfq_agent.persistence.models`;
+* :mod:`rfq_agent.persistence.writers` - the write path
+  (:class:`~rfq_agent.persistence.writers.QuoteWriter`), the only module in the
+  package that changes data, imported from its own module rather than re-exported:
+  reading and writing are different seams, and the reader never needs the writer.
 
 Schema *creation* is the migration's job, not this package's: there is
 deliberately no ``create_all()`` helper in production code, so no code path can

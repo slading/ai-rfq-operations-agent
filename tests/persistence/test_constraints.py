@@ -441,18 +441,41 @@ def test_line_with_unusable_price_must_be_blocked(session: Session, core: Core) 
     session.add(quote_row(core))
     session.commit()
 
-    session.add(quote_line_row(core, price_status=PriceLookupStatus.MISSING))
+    session.add(quote_line_row(core, price_status=PriceLookupStatus.MISSING, price_entry_id=None))
     _commit_fails(session, "CHECK")
 
     session.add(
         quote_line_row(
             core,
             price_status=PriceLookupStatus.MISSING,
+            price_entry_id=None,
             blocked=True,
             blocked_reason="no price on file",
         )
     )
     session.commit()
+
+
+def test_a_line_with_no_usable_price_cannot_name_a_price_entry(
+    session: Session, core: Core
+) -> None:
+    """D-1's pairing rule: provenance and price status have to agree.
+
+    A row that says "no usable price" and then points at a price entry is
+    evidence of a price that was never applied, and the schema refuses it.
+    """
+    session.add(quote_row(core))
+    session.commit()
+
+    session.add(
+        quote_line_row(
+            core,
+            price_status=PriceLookupStatus.EXPIRED,
+            blocked=True,
+            blocked_reason="price expired",
+        )
+    )
+    _commit_fails(session, "CHECK")
 
 
 def test_line_without_stock_must_be_blocked(session: Session, core: Core) -> None:

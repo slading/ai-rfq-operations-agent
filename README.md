@@ -13,7 +13,7 @@ and business data, and every consequential action requires a human.
 state machine contract and the provider-neutral interfaces.
 
 **Phase 1A — persistence.** SQLite through synchronous SQLAlchemy 2.0, with the
-schema versioned by Alembic: 25 tables, append-only audit triggers, and the run
+schema versioned by Alembic: 26 tables, append-only audit triggers, and the run
 state machine enforced by the database itself. Migrations are the only way a
 schema is created — there is no `create_all()` in production code.
 
@@ -98,7 +98,27 @@ on the line, ordered by the contract's own code order, and identical facts alway
 produce an identical ledger. Nothing is approved, rejected or transitioned: this
 projects the reasons a human will see, and gives them nothing to argue with.
 
-No provider calls, agent loop, worker, write path or UI yet.
+**Phase 1J' — the write path.** Where the accepted output becomes rows. Two
+decisions settled Phase 1J's stop. A line with no usable price is now storable:
+`quote_lines.price_entry_id` is nullable, the foreign key stays (a price entry
+that *is* named must exist), and the pairing `(price_status = 'FOUND') =
+(price_entry_id IS NOT NULL)` is enforced in the schema - so a refused line is
+stored blocked, with no price entry and no money, and the domain's
+`PRICE_MISSING` sentinel is translated to SQL `NULL` at this boundary and
+nowhere else. And the projected ledger gets a table of its own,
+`quote_blocked_reasons`: one append-only row per reason in the order it was
+projected, with the line it is about, whether a human can resolve it and the
+ledger's flags, guarded by the same `UPDATE`/`DELETE` triggers as the audit
+tables and written by nothing else. A quote's header, its lines in ordinal order
+and that evidence are written in **one transaction**: a failure anywhere leaves
+nothing behind, including the idempotency claim, which is taken and released in
+the same unit of work - so a retry after a crash is free rather than half
+applied. Repeating an identical write stores nothing new and is not a new quote
+revision, and a *different* quotation for the same run is refused by
+`(run_id, revision)` instead of quietly becoming revision 2. Nothing is
+recalculated, no gate runs, no status changes and no approval is recorded.
+
+No provider calls, agent loop, worker, gate execution, approval or UI yet.
 
 The approved V1 design (state machine, failure model, trust boundary, evaluation
 strategy) is not committed yet — it lands as `docs/ARCHITECTURE.md` alongside the
