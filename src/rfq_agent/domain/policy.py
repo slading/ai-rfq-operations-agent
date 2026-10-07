@@ -14,6 +14,13 @@ lives in :mod:`rfq_agent.domain.gating` (it needs the quote schema, and keeping
 it there keeps the import graph acyclic). ``PolicyDecision.allowed`` means "no
 unresolved business condition blocks this quote"; it never means "send it".
 
+:class:`PolicyGateDecision` (Phase 1K) is that decision with its identity and its
+evidence attached. It answers exactly one question - *is this quote eligible to
+proceed to a future human review step?* - and refuses to answer ``yes`` on
+anything but complete, un-contradicted evidence. It is not approval and not
+sendability; a decision's :attr:`~PolicyGateDecision.eligible_for_human_review`
+is the only field a consumer may act on.
+
 :func:`select_discount` (Phase 1G) is the lookup the seeded rules describe -
 "the lookup (highest priority, narrowest scope, active, in window)" - and the
 only place a discount rule is chosen. It is a pure function over the read
@@ -45,6 +52,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCKING_BLOCKED_REASONS",
+    "GATE_VERSION",
     "BlockedReason",
     "BlockedReasonCode",
     "DiscountApplication",
@@ -52,7 +60,9 @@ __all__ = [
     "DiscountScope",
     "DiscountSelection",
     "PolicyDecision",
+    "PolicyEvidenceStatus",
     "PolicyFlag",
+    "PolicyGateDecision",
     "QuoteBlockedLedger",
     "select_discount",
 ]
@@ -162,6 +172,118 @@ class PolicyDecision(DomainModel):
             raise ValueError(msg)
         if not self.allowed and self.requires_human_approval:
             msg = "requires_human_approval only applies to an otherwise-clean quote"
+            raise ValueError(msg)
+        return self
+
+
+#: The rule set that produced a gate decision (Phase 1K). Bumped whenever the
+#: gate's semantics change, so a recorded decision names the rules that made it -
+#: the same device as ``CALC_VERSION`` on the quote.
+GATE_VERSION = "gate-v1"
+
+
+class PolicyEvidenceStatus(StrEnum):
+    """How well the supplied evidence supports a gate decision (Phase 1K).
+
+    ``COMPLETE`` is the only status under which a quote can be eligible for
+    human review. The other three name *why* the evidence cannot carry the
+    decision, so a defect is recorded as what it is instead of being encoded as
+    a business reason code no fact supports:
+
+    * ``INCOMPLETE`` - evidence the decision needs was not supplied or not
+      established: the ledger omits a fact the quote proves, or the customer's
+      credit-hold status was never stated.
+    * ``CONTRADICTORY`` - two supplied facts disagree: the ledger claims a
+      blocking code the quote's own facts deny, the two delivery assessments
+      disagree, or one condition is reported as both blocking and non-blocking.
+    * ``UNSUPPORTED`` - the inputs describe a state this rule set cannot certify:
+      a quote that is already terminal, or a policy that does not require human
+      approval.
+
+    The statuses are ordered by severity - ``CONTRADICTORY`` over
+    ``UNSUPPORTED`` over ``INCOMPLETE`` - and a decision reports the most severe
+    condition it found.
+    """
+
+    COMPLETE = "COMPLETE"
+    INCOMPLETE = "INCOMPLETE"
+    CONTRADICTORY = "CONTRADICTORY"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+class PolicyGateDecision(PolicyDecision):
+    """A gate decision with its identity and its evidence attached (Phase 1K).
+
+    One question, and only one: *is this quote eligible to proceed to a future
+    human review step?* The answer is
+    :attr:`~PolicyGateDecision.eligible_for_human_review`, and it is the only
+    field a consumer of this decision may act on. It is **not** approval, not
+    sendability, not the workflow's ``READY`` state and not a customer-visible
+    claim: a quote can be eligible for review and still never leave the building.
+
+    The inherited fields keep their accepted meanings (Phase 1I):
+
+    * :attr:`~PolicyDecision.allowed` is "the supplied facts assert no unresolved
+      business condition". It is deliberately *not* the eligibility bit: a
+      contradiction between the ledger and the quote is not a condition the
+      quote's facts contain, so ``allowed`` can be ``True`` while the decision is
+      not eligible.
+    * :attr:`~PolicyDecision.reason_codes` is the codes the inputs assert, in the
+      contract's own order. Where the ledger reported the code, its own message is
+      kept; where the gate asserts a fact for itself - a blocking fact the quote
+      proves but the ledger omits (R2), or a caller fact no ledger entry carries -
+      the message is the gate's own wording and is never presented as an original
+      ledger entry.
+    * :attr:`~PolicyDecision.requires_human_approval` is the V1 policy: even a
+      clean quote needs a human.
+
+    The new fields record what the answer was computed from, so the decision can
+    be re-checked rather than trusted:
+
+    * :attr:`evidence_status` - ``COMPLETE`` is required for eligibility; the
+      other statuses name why the evidence cannot carry the decision;
+    * :attr:`evidence_sha256` - a fingerprint of exactly the facts decided over,
+      so the same facts can be shown to produce the same answer;
+    * :attr:`quote_inputs_sha256` - the quote's own input fingerprint, binding
+      the decision to the artefact it is about (``None`` when the quote carries
+      none).
+
+    The validators make the two fail-open shapes unrepresentable: an eligible
+    decision must rest on complete, un-contradicted evidence with no asserted
+    code, and a decision that is not eligible must say what stopped it - a code,
+    or a named evidence defect.
+    """
+
+    quote_id: QuoteId
+    run_id: RunId
+    #: True only on complete, un-contradicted evidence under the V1 policy.
+    eligible_for_human_review: bool
+    evidence_status: PolicyEvidenceStatus
+    #: The rule set that produced this decision; see :data:`GATE_VERSION`.
+    gate_version: str = GATE_VERSION
+    #: Fingerprint of the facts this decision was made over.
+    evidence_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    #: The quote's own ``inputs_sha256``; ``None`` when it carries none.
+    quote_inputs_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")] | None = None
+
+    @model_validator(mode="after")
+    def _check_eligibility_agreement(self) -> Self:
+        """Eligibility is implied by, and implies, the evidence it rests on."""
+        if self.eligible_for_human_review:
+            if self.evidence_status is not PolicyEvidenceStatus.COMPLETE:
+                msg = "a quote can only be eligible for human review on COMPLETE evidence"
+                raise ValueError(msg)
+            if self.reason_codes:
+                msg = "an eligible quote carries no blocking reason codes"
+                raise ValueError(msg)
+            if not self.requires_human_approval:
+                msg = "eligibility requires the V1 policy: a human must approve"
+                raise ValueError(msg)
+        elif self.evidence_status is PolicyEvidenceStatus.COMPLETE and not self.reason_codes:
+            msg = (
+                "a decision that is not eligible must name a blocking reason code "
+                "or an evidence defect"
+            )
             raise ValueError(msg)
         return self
 

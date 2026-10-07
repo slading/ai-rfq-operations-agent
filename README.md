@@ -118,7 +118,36 @@ revision, and a *different* quotation for the same run is refused by
 `(run_id, revision)` instead of quietly becoming revision 2. Nothing is
 recalculated, no gate runs, no status changes and no approval is recorded.
 
-No provider calls, agent loop, worker, gate execution, approval or UI yet.
+**Phase 1K — the gate decides.** The deterministic gate stops being a function
+nobody calls and answers exactly one question: *is this quotation eligible for a
+future human review step?* The answer
+is deliberately narrow — not an approval, not sendability and not a workflow
+state; a quotation can be eligible for review and never leave the building, and in
+V1 the human approval is still outstanding even when the answer is yes. It is one
+pure pass over facts that already exist (the quote, the projected ledger, the
+caller's credit-hold and delivery facts, the approval policy), and it decides
+*about* the evidence rather than taking its word: a blocking fact the quote
+itself proves must appear in the ledger, or the evidence is `INCOMPLETE`; a
+ledger entry no supplied fact witnesses is `CONTRADICTORY` and is **not** recorded
+as a fact — the gate will not launder a denied claim into the ledger; two
+delivery assessments that disagree are `CONTRADICTORY`; one condition reported as
+both a blocking reason and a non-blocking flag is `CONTRADICTORY`; a quote that
+is already terminal, or a policy that does not require human approval, is
+`UNSUPPORTED`; a blocked line no code accounts for, or a credit-hold status
+nobody established, is `INCOMPLETE`. Only `COMPLETE` evidence with no asserted
+code, under the V1 rule that a human approves, makes a quotation eligible — so
+every missing, unsupported or contradictory fact fails closed. The decision says
+what it decided over: the quote's and run's identity, the rule set (`gate-v1`),
+the quote's own input fingerprint and a fingerprint of the exact facts, stable
+across runs and input order. The credit-hold fact is now explicit — `None` means
+"not established" and fails closed, so "nobody checked" can never read as "the
+account is fine" — while `project_blocked_ledger`'s accepted five-fact mapping is
+unchanged. Nothing is approved, sent, transitioned or promoted: the quote stays a
+draft, no gate outcome is persisted yet, and no row changes.
+
+No provider calls, agent loop, worker, approval, outbound message or UI yet; the
+gate decision is not persisted yet either — Phase 1K decides, and the write path
+for its evidence is the next phase.
 
 The approved V1 design (state machine, failure model, trust boundary, evaluation
 strategy) is not committed yet — it lands as `docs/ARCHITECTURE.md` alongside the
