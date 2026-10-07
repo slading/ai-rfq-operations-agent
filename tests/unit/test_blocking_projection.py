@@ -40,9 +40,12 @@ from rfq_agent.domain.gating import (
     project_blocked_ledger,
 )
 from rfq_agent.domain.policy import (
+    BlockedReason,
     BlockedReasonCode,
     DiscountApplication,
     DiscountScope,
+    PolicyEvidenceStatus,
+    PolicyGateDecision,
     QuoteBlockedLedger,
 )
 from rfq_agent.domain.pricing import PriceEntry, select_price
@@ -745,3 +748,109 @@ def test_the_quote_status_is_untouched_by_projection() -> None:
     project(calculation, customer_on_credit_hold=True)
 
     assert calculation.quote.status is status_before
+
+
+# ---------------------------------------------------------------------------
+# Into the gate decision (Phase 1K)
+# ---------------------------------------------------------------------------
+#
+# The projection and the decision are two halves of one pipeline: facts from the
+# calculation become ledger entries, and the decision reads those entries back
+# against the very quote they came from. These tests walk the joint, because the
+# place a pipeline breaks is between its halves.
+
+
+def decision_for(
+    calculation: QuoteCalculation,
+    *,
+    customer_on_credit_hold: bool = False,
+) -> PolicyGateDecision:
+    """Project a calculation and decide about it, the way the caller will."""
+    ledger = project(calculation, customer_on_credit_hold=customer_on_credit_hold)
+    return evaluate_quote_gate(
+        PolicyGateInput(
+            quote=calculation.quote,
+            blocked_reasons=ledger.reasons,
+            customer_on_credit_hold=customer_on_credit_hold,
+        )
+    )
+
+
+def test_a_clean_calculation_decides_in_favour_of_review() -> None:
+    """Facts in, a reviewable quote out - and still not an approval."""
+    calculation = build([line(1), line(2)])
+
+    decision = decision_for(calculation)
+
+    assert calculation.complete
+    assert decision.eligible_for_human_review is True
+    assert decision.evidence_status is PolicyEvidenceStatus.COMPLETE
+    assert decision.reason_codes == ()
+    assert decision.requires_human_approval is True
+
+
+def test_the_projection_and_the_decision_agree_about_every_code() -> None:
+    """The ledger's entries are the decision's codes, exactly - no more, no less."""
+    calculation = build(
+        [line(1, entries=[]), line(2, stock_status=StockStatus.UNKNOWN), line(3)],
+        discount=approval_discount(),
+        delivery=promise(DeliveryFeasibility.INFEASIBLE),
+    )
+
+    ledger = project(calculation, customer_on_credit_hold=True)
+    decision = evaluate_quote_gate(
+        PolicyGateInput(
+            quote=calculation.quote,
+            blocked_reasons=ledger.reasons,
+            customer_on_credit_hold=True,
+        )
+    )
+
+    assert decision.eligible_for_human_review is False
+    assert decision.evidence_status is PolicyEvidenceStatus.COMPLETE
+    assert decision.reason_codes == tuple(reason.code for reason in ledger.reasons)
+    assert decision.allowed is False
+
+
+def test_a_missing_entry_is_incomplete_evidence_not_a_clean_decision() -> None:
+    """Dropping a fact from the ledger cannot make a blocked quote reviewable."""
+    calculation = build([line(1, stock_status=StockStatus.NONE)])
+    decision = evaluate_quote_gate(
+        PolicyGateInput(quote=calculation.quote, customer_on_credit_hold=False)
+    )
+
+    assert decision.eligible_for_human_review is False
+    assert decision.evidence_status is PolicyEvidenceStatus.INCOMPLETE
+    assert decision.reason_codes == (BlockedReasonCode.STOCK_INSUFFICIENT,)
+
+
+def test_a_ledger_entry_the_calculation_denies_is_a_contradiction() -> None:
+    """Inventing an entry for a clean calculation is caught, not recorded."""
+    calculation = build([line(1)])
+    decision = evaluate_quote_gate(
+        PolicyGateInput(
+            quote=calculation.quote,
+            blocked_reasons=(
+                BlockedReason(
+                    code=BlockedReasonCode.PRICE_MISSING,
+                    message="no price book entry for this line",
+                ),
+            ),
+            customer_on_credit_hold=False,
+        )
+    )
+
+    assert decision.evidence_status is PolicyEvidenceStatus.CONTRADICTORY
+    assert decision.reason_codes == ()
+
+
+def test_the_credit_hold_fact_still_reaches_the_decision() -> None:
+    """The one fact the projection cannot read from the quote is the caller's."""
+    calculation = build([line(1)])
+
+    without_hold = decision_for(calculation)
+    with_hold = decision_for(calculation, customer_on_credit_hold=True)
+
+    assert without_hold.eligible_for_human_review is True
+    assert with_hold.eligible_for_human_review is False
+    assert with_hold.reason_codes == (BlockedReasonCode.CREDIT_HOLD,)

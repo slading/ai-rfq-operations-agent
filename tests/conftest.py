@@ -17,7 +17,9 @@ from rfq_agent.contracts.llm import (
     ProviderName,
 )
 from rfq_agent.domain.ids import CustomerId, ProductId
-from rfq_agent.domain.quote import Quote, QuoteLine
+from rfq_agent.domain.pricing import PriceLookupStatus
+from rfq_agent.domain.quote import MISSING_PRICE_ENTRY_ID, Quote, QuoteLine
+from rfq_agent.domain.stock import StockStatus
 from rfq_agent.domain.trust import UntrustedEnvelope, UntrustedText
 
 CUSTOMER_ID: CustomerId = "CUST-0001"
@@ -103,6 +105,53 @@ def make_quote(lines: tuple[QuoteLine, ...] | None = None, **overrides: object) 
     }
     payload.update(overrides)
     return Quote.model_validate(payload)
+
+
+def make_refused_quote_line(
+    ordinal: int = 1,
+    *,
+    product_id: ProductId = PRODUCT_Y,
+    sku: str = "Y-500",
+    quantity: int = 15,
+    **overrides: object,
+) -> QuoteLine:
+    """Build a valid *blocked* line whose price lookup did not return ``FOUND``.
+
+    This is the Phase 1H shape for a line the calculator refused: no price and no
+    amount, the ``PRICE_MISSING`` sentinel for provenance, and a code-first
+    reason. Phase 1K's gate reads exactly this shape to know the quote proves a
+    ``PRICE_MISSING`` blocking fact of its own.
+    """
+    payload: dict[str, object] = {
+        "ordinal": ordinal,
+        "product_id": product_id,
+        "sku": sku,
+        "description": f"Test product {sku}",
+        "quantity": quantity,
+        "unit_price": Decimal("0"),
+        "price_entry_id": MISSING_PRICE_ENTRY_ID,
+        "line_extension": Decimal("0.00"),
+        "currency": "EUR",
+        "price_status": PriceLookupStatus.MISSING,
+        "blocked": True,
+        "blocked_reason": "MISSING/NO_MATCH: no price book entry matches this line",
+    }
+    payload.update(overrides)
+    return QuoteLine.model_validate(payload)
+
+
+def make_clean_quote(lines: tuple[QuoteLine, ...] | None = None, **overrides: object) -> Quote:
+    """Build a quote whose lines are unblocked: stock is stated, not left unknown.
+
+    :func:`make_quote` deliberately leaves ``stock_status`` at the schema default
+    (``UNKNOWN``, which the contract calls blocking), which is the right default
+    for tests about blocking. This builder states sufficient stock instead, so a
+    quote can be clean end to end.
+    """
+    resolved = (
+        lines if lines is not None else (make_quote_line(stock_status=StockStatus.SUFFICIENT),)
+    )
+    return make_quote(lines=resolved, **overrides)
 
 
 def make_capabilities(**overrides: object) -> ProviderCapabilities:
