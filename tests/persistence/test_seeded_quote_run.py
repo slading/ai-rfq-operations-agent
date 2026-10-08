@@ -23,6 +23,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ from rfq_agent.domain.policy import (
 )
 from rfq_agent.domain.pricing import PriceLookupStatus
 from rfq_agent.domain.quote import QuoteCalculation, QuoteStatus
+from rfq_agent.domain.stock import StockStatus, evaluate_stock
 from rfq_agent.persistence import Database
 from rfq_agent.persistence.models import (
     OutboundMessageRow,
@@ -239,6 +241,7 @@ class TestTheSeededRun:
         calculation = result.calculation
         assert calculation is not None
         quote = calculation.quote
+        assert [line.product_id for line in quote.lines] == ["PRD_0001", "PRD_0003"]
         assert [line.ordinal for line in quote.lines] == [1, 2]
         assert [line.unit_price for line in quote.lines] == [
             Decimal("1150.0000"),
@@ -247,8 +250,32 @@ class TestTheSeededRun:
         assert quote.subtotal == Decimal("3780.00")
         assert quote.discount is None
         assert quote.delivery is None
+        assert quote.status is QuoteStatus.DRAFT
         assert result.ledger is not None
         assert result.ledger.reasons == ()
+        assert result.eligible_for_human_review is True
+
+    def test_a_single_line_product_remains_eligible_when_stock_covers_it(
+        self, reader: BusinessReader
+    ) -> None:
+        """One 80-unit line uses the seeded 145 available units as before."""
+        result = run_quote(
+            clean_request(
+                lines=(line_request("PRD_0001", sku="PMP-A-100", quantity=80),),
+                delivery=None,
+                discount=None,
+            ),
+            reader,
+        )
+
+        assert result.status is QuoteRunStatus.COMPLETED
+        assert result.quote is not None
+        assert len(result.quote.lines) == 1
+        assert result.quote.lines[0].stock_status is StockStatus.SUFFICIENT
+        assert result.quote.status is QuoteStatus.DRAFT
+        assert result.decision is not None
+        assert result.decision.eligible_for_human_review is True
+        assert result.decision.requires_human_approval is True
 
     def test_no_delivery_question_means_no_promise_is_invented(
         self, reader: BusinessReader
@@ -270,6 +297,58 @@ class TestTheSeededRun:
 
 class TestTheRunFailsClosed:
     """Nothing is guessed, and a run that cannot decide says so instead."""
+
+    def test_duplicate_80_unit_lines_are_rejected_with_145_available_stock(
+        self, reader: BusinessReader
+    ) -> None:
+        """Two individually covered 80-unit lines cannot spend the same 145 units twice."""
+        stock = evaluate_stock(
+            reader.stock.levels_for_products(["PRD_0001"]),
+            product_id="PRD_0001",
+            requested_qty=80,
+            as_of=STOCK_STAMP,
+        )
+        assert stock.status is StockStatus.SUFFICIENT
+        assert stock.available_qty == 145
+
+        with pytest.raises(ValidationError, match=r"duplicate product_id values.*PRD_0001"):
+            run_quote(
+                clean_request(
+                    lines=(
+                        line_request("PRD_0001", sku="PMP-A-100", quantity=80),
+                        line_request("PRD_0001", sku="PMP-A-100", quantity=80),
+                    ),
+                    delivery=None,
+                    discount=None,
+                ),
+                reader,
+            )
+
+    def test_duplicate_product_lines_are_rejected_even_when_total_stock_covers_both(
+        self, reader: BusinessReader
+    ) -> None:
+        """No quantity aggregation or allocation is inferred, even when 120 fits in 145."""
+        stock = evaluate_stock(
+            reader.stock.levels_for_products(["PRD_0001"]),
+            product_id="PRD_0001",
+            requested_qty=120,
+            as_of=STOCK_STAMP,
+        )
+        assert stock.status is StockStatus.SUFFICIENT
+        assert stock.available_qty == 145
+
+        with pytest.raises(ValidationError, match=r"duplicate product_id values.*PRD_0001"):
+            run_quote(
+                clean_request(
+                    lines=(
+                        line_request("PRD_0001", sku="PMP-A-100", quantity=60),
+                        line_request("PRD_0001", sku="PMP-A-100", quantity=60),
+                    ),
+                    delivery=None,
+                    discount=None,
+                ),
+                reader,
+            )
 
     def test_an_unresolved_customer_stops_the_run(self, reader: BusinessReader) -> None:
         """No customer record, no quote - and no decision to misread as approval."""

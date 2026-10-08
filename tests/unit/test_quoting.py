@@ -150,6 +150,18 @@ class TestTheRequestContract:
         with pytest.raises(ValidationError):
             request(lines=())
 
+    def test_a_request_rejects_a_repeated_product_id(self) -> None:
+        """Two SKUs cannot make the same product's stock count twice."""
+        repeated = QuoteLineRequest(
+            product_id="PRD_0001",
+            sku="PMP-A-100-ALT",
+            description="Another line for the same catalogue product",
+            quantity=1,
+        )
+
+        with pytest.raises(ValidationError, match=r"duplicate product_id values.*PRD_0001"):
+            request(lines=(*request().lines, repeated))
+
     @pytest.mark.parametrize("question", ["delivery", "discount"])
     def test_two_lines_may_not_ask_a_one_line_question(self, question: str) -> None:
         """No accepted contract says which line such a question would be about."""
