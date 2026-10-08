@@ -61,6 +61,7 @@ MODULES = [
     "rfq_agent.persistence.repositories",
     "rfq_agent.persistence.types",
     "rfq_agent.persistence.writers",
+    "rfq_agent.quoting",
     "rfq_agent.seed",
     "rfq_agent.seed.dataset",
     "rfq_agent.seed.loader",
