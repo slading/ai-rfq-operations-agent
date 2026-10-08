@@ -37,6 +37,7 @@ by one of the accepted domain functions above.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Self
@@ -149,6 +150,20 @@ class QuoteRequest(DomainModel):
     #: V1; anything else makes the gate report the state it cannot certify (R8)
     #: rather than let a run pass without a human.
     require_human_approval: bool = True
+
+    @model_validator(mode="after")
+    def _check_product_ids_are_unique(self) -> Self:
+        """A product may appear on one line, so its stock cannot be reused twice."""
+        duplicates = sorted(
+            product_id
+            for product_id, count in Counter(line.product_id for line in self.lines).items()
+            if count > 1
+        )
+        if duplicates:
+            product_ids = ", ".join(duplicates)
+            msg = f"duplicate product_id values are not allowed across quote lines: {product_ids}"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _check_the_questions_fit_the_lines(self) -> Self:
