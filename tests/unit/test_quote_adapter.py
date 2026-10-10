@@ -356,6 +356,27 @@ class TestRefusals:
                 **stated(),
             )
 
+    def test_refuses_a_naive_stock_instant(self) -> None:
+        naive = datetime(2026, 10, 10, 9, 0, tzinfo=UTC).replace(tzinfo=None)
+        with pytest.raises(ValueError, match="stock_as_of must be timezone-aware"):
+            to_quote_request(
+                make_customer(),
+                [make_line()],
+                **stated(stock_as_of=naive),
+            )
+
+    def test_refuses_a_naive_delivery_instant(self) -> None:
+        naive = datetime(2026, 10, 10, 9, 0, tzinfo=UTC).replace(tzinfo=None)
+        requested = RequestedDelivery(destination="Warsaw")
+        with pytest.raises(ValueError, match="delivery_as_of must be timezone-aware"):
+            to_quote_request(
+                make_customer(),
+                [make_line()],
+                requested_delivery=requested,
+                delivery_as_of=naive,
+                **stated(),
+            )
+
 
 class TestPurity:
     def test_source_reads_no_clock_and_mints_nothing(self) -> None:

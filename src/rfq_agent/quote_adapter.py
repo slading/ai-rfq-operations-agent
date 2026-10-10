@@ -23,9 +23,10 @@ boundary:
   extraction contract keeps ``INFERRED`` dates out of
   ``requested_delivery_date``, so they stay out of the question too);
 * **refusals are loud.** An unquotable customer, a line that is not
-  ``RESOLVED``, a missing required fact, a requested delivery that cannot be
-  asked about and a product resolved on more than one line all raise
-  ``ValueError`` before any request exists. Nothing is silently dropped: a
+  ``RESOLVED``, a missing required fact, a naive as-of instant, a requested
+  delivery that cannot be asked about and a product resolved on more than
+  one line all raise ``ValueError`` before any request exists. Nothing is
+  silently dropped: a
   delivery request that cannot be mapped is a refusal, not a ``delivery=None``;
 * **human approval is mandatory.** Every request built here carries
   ``require_human_approval=True`` and no parameter can ask for anything else -
@@ -98,6 +99,9 @@ def to_quote_request(
             something, or asking the engine a question it refuses.
 
     """
+    if stock_as_of.utcoffset() is None:
+        msg = "stock_as_of must be timezone-aware: stock age is judged against this instant"
+        raise ValueError(msg)
     customer_id = _require_quotable_customer(customer)
     if not lines:
         msg = "a quote request asks for at least one line: none were given"
@@ -241,6 +245,9 @@ def _to_delivery_question(
         raise ValueError(msg)
     if delivery_as_of is None:
         msg = "a delivery question needs the instant it is asked at: none was stated"
+        raise ValueError(msg)
+    if delivery_as_of.utcoffset() is None:
+        msg = "delivery_as_of must be timezone-aware: cut-offs are UTC"
         raise ValueError(msg)
     return DeliveryQuestion(
         destination=destination,
