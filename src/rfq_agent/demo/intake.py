@@ -12,10 +12,14 @@ Three rules keep it honest:
 * **get-or-create, never create-or-fail.** Re-running the demo on the same
   database finds its own rows and continues - which is also what lets the
   ``DUPLICATE`` outcome be demonstrated at the quote layer.
-* **a conflict is refused, never overwritten.** The same fixture identifier
-  holding different content means the database is not the one this fixture
-  describes; the demo stops rather than edit an intake record (the intake
-  audit model is append-only by design).
+* **identical means identical.** A stored row is reused only when *every*
+  fixture-owned field matches: for the RFQ the intake content (sender identity,
+  subject, body and its hash, channel, status, received instant, key, metadata),
+  for the run its entire initial lifecycle (parent RFQ, attempt number,
+  trigger, state, instants and the untouched lifecycle fields). A row under a
+  fixture identifier that differs anywhere is refused, field names stated -
+  never overwritten (the intake audit model is append-only by design, and a
+  run the demo did not leave in ``RECEIVED`` is not the demo's run).
 * **everything is stated by the fixture.** The RFQ's stored hashes are pure
   functions of the fixture's untrusted text (:func:`sha256_text`), and both
   rows take their instants from the fixture - no clock is read here.
@@ -45,6 +49,40 @@ __all__ = ["provision_run", "require_prerequisites"]
 #: The customer whose presence proves the demo dataset has been written.
 _DATASET_SENTINEL = "CUS_0001"
 
+#: Every RFQ field the fixture owns. The primary key is excluded - it is how
+#: the row is found - and so are ``created_at``/``updated_at``, which the
+#: database stamps and the fixture does not.
+_RFQ_CONTENT_FIELDS: tuple[str, ...] = (
+    "source_channel",
+    "status",
+    "received_at",
+    "subject",
+    "body_text",
+    "body_sha256",
+    "sender_name",
+    "sender_email",
+    "sender_email_hash",
+    "idempotency_key",
+    "thread_key",
+    "superseded_by_rfq_id",
+)
+
+#: Every run field the fixture owns: the whole initial lifecycle.
+_RUN_CONTENT_FIELDS: tuple[str, ...] = (
+    "rfq_id",
+    "attempt_no",
+    "trigger",
+    "state",
+    "prior_run_id",
+    "outcome",
+    "failure_code",
+    "retry_count",
+    "checkpoint_stage",
+    "row_version",
+    "started_at",
+    "finished_at",
+)
+
 
 def require_prerequisites(session: Session) -> None:
     """Raise :class:`DemoError` unless the database is ready to demonstrate on.
@@ -73,17 +111,19 @@ def require_prerequisites(session: Session) -> None:
 def provision_run(session: Session, scenario: DemoScenario) -> None:
     """Get-or-create the RFQ and run rows ``scenario`` states.
 
-    An existing pair whose content matches the fixture is reused untouched.
-    An existing row with the fixture's identifier but different content is a
-    contradiction the demo refuses: it exits rather than modify intake rows.
+    An existing pair is reused only when every fixture-owned field is
+    identical to what the fixture states. A row under a fixture identifier
+    with any difference - another sender, another subject, a lifecycle that
+    moved past ``RECEIVED`` - is a contradiction the demo refuses rather than
+    modifies.
 
     Args:
         session: The unit of work both rows are written in. The caller commits.
         scenario: The fixture stating every identifier and instant.
 
     Raises:
-        DemoError: When a row already exists under a fixture identifier with
-            different content.
+        DemoError: When a stored row under a fixture identifier differs from
+            the fixture in any owned field. The differing fields are named.
     """
     rfq = session.get(RfqRow, scenario.rfq_id)
     if rfq is None:
@@ -91,24 +131,36 @@ def provision_run(session: Session, scenario: DemoScenario) -> None:
         # Flush between dependency levels: the models declare no relationships,
         # so SQLAlchemy does not order the inserts by foreign key.
         session.flush()
-    elif rfq.idempotency_key != _idempotency_key(scenario) or rfq.body_sha256 != sha256_text(
-        scenario.body
-    ):
-        msg = (
-            f"RFQ {scenario.rfq_id!r} already exists with different content: refusing to "
-            "overwrite it. Demonstrate against a scratch database (`--url`) or remove the "
-            "demo rows first"
-        )
-        raise DemoError(msg)
+    else:
+        _require_identical(rfq, _rfq_row(scenario), _RFQ_CONTENT_FIELDS, "RFQ", scenario.rfq_id)
 
     run = session.get(RunRow, scenario.run_id)
     if run is None:
         session.add(_run_row(scenario))
         session.flush()
-    elif run.rfq_id != scenario.rfq_id:
+    else:
+        _require_identical(run, _run_row(scenario), _RUN_CONTENT_FIELDS, "run", scenario.run_id)
+
+
+def _require_identical(
+    stored: RfqRow | RunRow,
+    expected: RfqRow | RunRow,
+    fields: tuple[str, ...],
+    kind: str,
+    identifier: str,
+) -> None:
+    """Refuse when the stored row is not the row the fixture states.
+
+    Not a lookup rule: the demo's identifiers pin *content*, so a stored row
+    that is not field-for-field the fixture's own is a different history the
+    demonstration must not silently join - and must never rewrite.
+    """
+    mismatches = [name for name in fields if getattr(stored, name) != getattr(expected, name)]
+    if mismatches:
         msg = (
-            f"run {scenario.run_id!r} already exists for a different RFQ ({run.rfq_id!r}): "
-            "refusing to overwrite it. Demonstrate against a scratch database (`--url`) or "
+            f"{kind} {identifier!r} already exists as different content "
+            f"({', '.join(mismatches)}): refusing to overwrite it. The demo only reuses rows "
+            "identical to its fixture - demonstrate against a scratch database (`--url`) or "
             "remove the demo rows first"
         )
         raise DemoError(msg)

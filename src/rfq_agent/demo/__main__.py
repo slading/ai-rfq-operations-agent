@@ -20,6 +20,9 @@ import argparse
 import sys
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
+from rfq_agent.config import Settings
 from rfq_agent.demo import (
     SCENARIOS,
     DemoError,
@@ -57,8 +60,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--url",
         default=None,
-        help="database URL; defaults to RFQ_DATABASE__URL (sqlite:///var/rfq_agent.db). "
-        "The database must already be migrated and seeded - the demo prepares neither.",
+        help="database URL; defaults to the application configuration "
+        "(RFQ_DATABASE__URL, then .env, then sqlite:///var/rfq_agent.db) - the same "
+        "resolution alembic uses. The database must already be migrated and seeded.",
     )
     parser.add_argument(
         "--scenario",
@@ -98,7 +102,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.scenario
             else list(SCENARIOS)
         )
-        database = Database.create(args.url)
+        # The default URL resolves exactly as the runtime and alembic resolve
+        # theirs (Settings.load reads RFQ_* and .env): migration and demo can
+        # never silently target different databases.
+        database = Database.create(args.url or Settings.load().database.url)
         try:
             with database.session() as session:
                 require_prerequisites(session)
@@ -114,6 +121,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             database.dispose()
     except DemoError as error:
         print(f"error: {error}", file=sys.stderr)
+        return 2
+    except ValidationError as error:
+        print(
+            f"error: invalid configuration (RFQ_* environment or .env):\n{error}",
+            file=sys.stderr,
+        )
         return 2
     except ValueError as error:
         print(

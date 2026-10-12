@@ -236,12 +236,24 @@ fails loudly if a run stops matching its fixture's declared outcome.
   whose credit hold becomes stored blocking evidence — `DRAFT_BLOCKED`.
 
 Re-running the demo recognises its own work: the provisioned RFQ/run rows are
-reused (a conflicting row under a fixture identifier is refused, never
-overwritten) and the identical quote write reports `DUPLICATE`. Limits, stated
-plainly: no quote is ever approved or sent, no run changes state, and the gate
-decision printed on stdout is never stored. The command requires an already
-migrated and seeded database and prepares neither — missing schema or dataset
-is reported as the command that fixes it (exit 2).
+reused only when every fixture-owned field is identical (a row under a fixture
+identifier that differs anywhere — another sender, a lifecycle that moved past
+`RECEIVED` — is refused, never overwritten) and the identical quote write
+reports `DUPLICATE`. Limits, stated plainly: no quote is ever approved or
+sent, no run changes state, and the gate decision printed on stdout is never
+stored. The command requires an already migrated and seeded database and
+prepares neither — missing schema or dataset is reported as the command that
+fixes it (exit 2).
+
+**Which database.** With no `--url`, the demo resolves the database exactly
+like `alembic` and the application do — `RFQ_DATABASE__URL`, then `.env`, then
+`sqlite:///var/rfq_agent.db` — so `make migrate` and `make demo` always
+target the same file. Note one accepted-behaviour quirk: the seed command
+(Phase 1B, frozen) uses the same default file but does not read
+`RFQ_DATABASE__URL`; when migrating to a non-default location, pass `--url`
+explicitly to both `python -m rfq_agent.seed` and `python -m rfq_agent.demo`.
+Unifying the seed command with the same one-line resolution is a documented
+follow-up, not part of this phase.
 
 ## Configuration
 

@@ -1,10 +1,11 @@
 """The demo provisioning shim's contract (Phase 1M-C).
 
-The shim is get-or-create over fixture-stated rows: it writes the RFQ and its
-run exactly once, recognises its own work on a re-run, and refuses - rather
-than overwrites - a row that holds the fixture's identifier with different
-content. The prerequisite check reports a missing schema or dataset as the
-command that fixes it, because the demo prepares neither.
+The shim is get-or-create over fixture-stated rows, and *identical means
+identical*: it writes the RFQ and its run exactly once, reuses them only when
+every fixture-owned field matches, and refuses - field names stated, never an
+overwrite - a row that holds the fixture's identifier with different content.
+The prerequisite check reports a missing schema or dataset as the command
+that fixes it, because the demo prepares neither.
 """
 
 from __future__ import annotations
@@ -33,6 +34,41 @@ if TYPE_CHECKING:
 
 SCENARIO = SCENARIOS[0]
 OTHER = SCENARIOS[2]
+
+
+def fixture_rfq_row(**overrides: object) -> RfqRow:
+    """The RFQ exactly as the shim would store it, with one field overridden."""
+    values: dict[str, object] = {
+        "rfq_id": SCENARIO.rfq_id,
+        "source_channel": SourceChannel.FIXTURE,
+        "status": RfqStatus.OPEN,
+        "received_at": SCENARIO.received_at,
+        "subject": SCENARIO.subject,
+        "body_text": SCENARIO.body,
+        "body_sha256": sha256_text(SCENARIO.body),
+        "sender_name": SCENARIO.sender_name,
+        "sender_email": SCENARIO.sender_email,
+        "sender_email_hash": sha256_text(SCENARIO.sender_email),
+        "idempotency_key": "demo:intake:SC-01",
+        "thread_key": None,
+        "superseded_by_rfq_id": None,
+    }
+    values.update(overrides)
+    return rfq_row(**values)
+
+
+def fixture_run_row(**overrides: object) -> RunRow:
+    """The run exactly as the shim would store it, with one field overridden."""
+    values: dict[str, object] = {
+        "run_id": SCENARIO.run_id,
+        "rfq_id": SCENARIO.rfq_id,
+        "attempt_no": 1,
+        "trigger": RunTrigger.INITIAL,
+        "state": RunState.RECEIVED,
+        "started_at": SCENARIO.received_at,
+    }
+    values.update(overrides)
+    return run_row(**values)
 
 
 class TestProvisionRun:
@@ -67,38 +103,18 @@ class TestProvisionRun:
         assert session.scalar(select(func.count()).select_from(RfqRow)) == 1
         assert session.scalar(select(func.count()).select_from(RunRow)) == 1
 
-    def test_a_conflicting_rfq_is_refused_never_overwritten(self, session: Session) -> None:
-        # A *pre-existing* row - committed, as it would be from an earlier run.
-        session.add(rfq_row(SCENARIO.rfq_id, idempotency_key="intake:other", body_sha256="b" * 64))
+    def test_reprovisioning_after_a_committed_run_still_recognises_them(
+        self, session: Session
+    ) -> None:
+        """Row content round-trips: a fresh read still matches the fixture exactly."""
+        provision_run(session, SCENARIO)
         session.commit()
-
-        with pytest.raises(DemoError, match=rf"RFQ {SCENARIO.rfq_id!r} already exists"):
-            provision_run(session, SCENARIO)
         session.rollback()
 
-        assert session.get(RfqRow, SCENARIO.rfq_id).body_sha256 == "b" * 64
-
-    def test_a_conflicting_run_is_refused_never_overwritten(self, session: Session) -> None:
-        # The RFQ half must pass its own identity check first, so the run
-        # conflict is what the call actually trips over.
-        session.add(
-            rfq_row(
-                SCENARIO.rfq_id,
-                idempotency_key="demo:intake:SC-01",
-                body_sha256=sha256_text(SCENARIO.body),
-            )
-        )
-        session.flush()
-        session.add(rfq_row(OTHER.rfq_id, idempotency_key="intake:other-rfq"))
-        session.flush()
-        session.add(run_row(SCENARIO.run_id, OTHER.rfq_id))
-        session.commit()
-
-        with pytest.raises(DemoError, match="already exists for a different RFQ"):
-            provision_run(session, SCENARIO)
-        session.rollback()
-
-        assert session.get(RunRow, SCENARIO.run_id).rfq_id == OTHER.rfq_id
+        provision_run(session, SCENARIO)
+        provision_run(session, SCENARIO)
+        assert session.scalar(select(func.count()).select_from(RfqRow)) == 1
+        assert session.scalar(select(func.count()).select_from(RunRow)) == 1
 
     def test_rows_survive_for_the_writer(self, session: Session) -> None:
         """The provisioned run is exactly the parent ``QuoteWriter`` looks up."""
@@ -109,6 +125,119 @@ class TestProvisionRun:
         run = session.get(RunRow, SCENARIO.run_id)
         assert run is not None
         assert run.state is RunState.RECEIVED
+
+
+class TestConflictingRowsAreRefused:
+    """get-or-create enforces *identical*: any field's difference is a refusal."""
+
+    def test_a_different_idempotency_key_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row(idempotency_key="intake:other"))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"different content \(idempotency_key\)"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RfqRow, SCENARIO.rfq_id).idempotency_key == "intake:other"
+
+    def test_a_different_body_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row(body_sha256="b" * 64, body_text="different request text"))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"already exists as different content"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RfqRow, SCENARIO.rfq_id).body_sha256 == "b" * 64
+
+    def test_a_different_rfq_subject_is_rejected_even_with_matching_key_and_hash(
+        self, session: Session
+    ) -> None:
+        session.add(fixture_rfq_row(subject="RFQ: a quietly changed subject"))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"\(subject\)"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RfqRow, SCENARIO.rfq_id).subject == "RFQ: a quietly changed subject"
+
+    def test_a_different_sender_is_rejected_even_with_matching_key_and_hash(
+        self, session: Session
+    ) -> None:
+        another = "vertrieb@nordwind-industrie.de"
+        session.add(fixture_rfq_row(sender_email=another, sender_email_hash=sha256_text(another)))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"sender_email"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RfqRow, SCENARIO.rfq_id).sender_email == another
+
+    def test_a_different_received_at_is_rejected(self, session: Session) -> None:
+        earlier = datetime(2026, 10, 5, 9, 0, tzinfo=UTC)
+        session.add(fixture_rfq_row(received_at=earlier))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"\(received_at\)"):
+            provision_run(session, SCENARIO)
+
+    def test_a_different_channel_or_status_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row(source_channel=SourceChannel.EMAIL))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"source_channel"):
+            provision_run(session, SCENARIO)
+
+    def test_a_run_of_a_different_rfq_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row())
+        session.add(rfq_row(OTHER.rfq_id, idempotency_key="intake:other-rfq"))
+        session.flush()
+        session.add(fixture_run_row(rfq_id=OTHER.rfq_id))
+        session.commit()
+
+        with pytest.raises(DemoError, match=rf"run {SCENARIO.run_id!r} already exists.*\(rfq_id\)"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RunRow, SCENARIO.run_id).rfq_id == OTHER.rfq_id
+
+    def test_a_run_that_moved_on_is_rejected(self, session: Session) -> None:
+        """Same RFQ, but a lifecycle past RECEIVED is not the demo's run."""
+        session.add(fixture_rfq_row())
+        session.flush()
+        session.add(fixture_run_row(state=RunState.CALCULATING))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"state"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RunRow, SCENARIO.run_id).state is RunState.CALCULATING
+
+    def test_a_run_with_a_different_trigger_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row())
+        session.flush()
+        session.add(fixture_run_row(trigger=RunTrigger.HUMAN_RERUN))
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"\(trigger\)"):
+            provision_run(session, SCENARIO)
+        session.rollback()
+
+        assert session.get(RunRow, SCENARIO.run_id).trigger is RunTrigger.HUMAN_RERUN
+
+    def test_a_run_with_a_different_attempt_or_start_is_rejected(self, session: Session) -> None:
+        session.add(fixture_rfq_row())
+        session.flush()
+        session.add(
+            fixture_run_row(attempt_no=2, started_at=datetime(2026, 10, 7, 9, 0, tzinfo=UTC))
+        )
+        session.commit()
+
+        with pytest.raises(DemoError, match=r"attempt_no, started_at"):
+            provision_run(session, SCENARIO)
 
 
 class TestRequirePrerequisites:

@@ -34,15 +34,16 @@ if TYPE_CHECKING:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run_cli(url: str, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run the demo command against ``url`` and capture its output.
+def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run the demo command with ``args`` and capture its output.
 
-    The argv list is built here, not passed through a shell: the only variable
-    is a database URL pointing at this test's temporary file.
+    The argv list is built here, not passed through a shell: the only
+    variables are a database URL pointing at this test's temporary file and,
+    for the configuration test, an explicit ``RFQ_DATABASE__URL``.
     """
-    environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+    environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), **(env or {})}
     return subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "rfq_agent.demo", "--url", url, *args],
+        [sys.executable, "-m", "rfq_agent.demo", *args],
         cwd=REPO_ROOT,
         env=environment,
         capture_output=True,
@@ -69,7 +70,7 @@ class TestTheDocumentedWalkthrough:
     def test_the_happy_path_persists_a_draft_awaiting_a_human(
         self, seeded_url: str, session: Session
     ) -> None:
-        result = _run_cli(seeded_url, "--scenario", "SC-01")
+        result = _run_cli("--url", seeded_url, "--scenario", "SC-01")
 
         assert result.returncode == 0, result.stderr
         assert "EXACT identity: CUS_0001" in result.stdout
@@ -95,7 +96,7 @@ class TestTheDocumentedWalkthrough:
     def test_the_ambiguous_sku_stops_before_any_quote(
         self, seeded_url: str, session: Session
     ) -> None:
-        result = _run_cli(seeded_url, "--scenario", "SC-02")
+        result = _run_cli("--url", seeded_url, "--scenario", "SC-02")
 
         assert result.returncode == 0, result.stderr
         assert "AMBIGUOUS - catalogue number matches PRD_0001, PRD_0002" in result.stdout
@@ -107,7 +108,7 @@ class TestTheDocumentedWalkthrough:
     def test_the_credit_hold_persists_its_blocking_evidence(
         self, seeded_url: str, session: Session
     ) -> None:
-        result = _run_cli(seeded_url, "--scenario", "SC-03")
+        result = _run_cli("--url", seeded_url, "--scenario", "SC-03")
 
         assert result.returncode == 0, result.stderr
         assert "the operator bound CUS_0007" in result.stdout
@@ -133,14 +134,14 @@ class TestTheDocumentedWalkthrough:
     def test_the_full_walkthrough_then_an_identical_free_retry(
         self, seeded_url: str, session: Session
     ) -> None:
-        first = _run_cli(seeded_url)
+        first = _run_cli("--url", seeded_url)
         assert first.returncode == 0, first.stderr
         assert (
             "summary: SC-01=DRAFT_AWAITING_HUMAN_REVIEW, "
             "SC-02=HUMAN_REQUIRED_BEFORE_QUOTE, SC-03=DRAFT_BLOCKED"
         ) in first.stdout
 
-        second = _run_cli(seeded_url)
+        second = _run_cli("--url", seeded_url)
         assert second.returncode == 0, second.stderr
         assert "identical quote QTE_DEMO_0001 was already stored - nothing new written" in (
             second.stdout
@@ -161,7 +162,7 @@ class TestTheDocumentedWalkthrough:
     def test_nothing_is_approved_sent_or_transitioned(
         self, seeded_url: str, session: Session
     ) -> None:
-        result = _run_cli(seeded_url)
+        result = _run_cli("--url", seeded_url)
         assert result.returncode == 0, result.stderr
 
         assert _count(session, "outbound_messages") == 0
@@ -177,23 +178,36 @@ class TestTheDocumentedWalkthrough:
         assert not_draft == 0
 
 
+class TestDatabaseResolution:
+    def test_without_url_the_cli_uses_the_configured_url(
+        self, seeded_url: str, session: Session
+    ) -> None:
+        """No ``--url``: ``RFQ_DATABASE__URL`` decides - the same resolution alembic uses."""
+        result = _run_cli("--scenario", "SC-01", env={"RFQ_DATABASE__URL": seeded_url})
+
+        assert result.returncode == 0, result.stderr
+        assert f"database: {seeded_url}" in result.stdout
+        assert "outcome   : DRAFT_AWAITING_HUMAN_REVIEW" in result.stdout
+        assert _count(session, "quotes") == 1
+
+
 class TestOperatorFailures:
     def test_a_missing_schema_is_reported_as_an_instruction(self, tmp_path: Path) -> None:
-        result = _run_cli(f"sqlite:///{tmp_path / 'empty.db'}")
+        result = _run_cli("--url", f"sqlite:///{tmp_path / 'empty.db'}")
 
         assert result.returncode == 2
         assert "alembic upgrade head" in result.stderr
         assert result.stdout == ""
 
     def test_a_missing_dataset_is_reported_as_an_instruction(self, database_path: Path) -> None:
-        result = _run_cli(f"sqlite:///{database_path}")
+        result = _run_cli("--url", f"sqlite:///{database_path}")
 
         assert result.returncode == 2
         assert "make seed" in result.stderr
         assert result.stdout == ""
 
     def test_an_unknown_scenario_lists_the_declared_ids(self, seeded_url: str) -> None:
-        result = _run_cli(seeded_url, "--scenario", "SC-99")
+        result = _run_cli("--url", seeded_url, "--scenario", "SC-99")
 
         assert result.returncode == 2
         assert "unknown scenario 'SC-99'" in result.stderr
@@ -201,7 +215,7 @@ class TestOperatorFailures:
         assert result.stdout == ""
 
     def test_list_scenarios_needs_no_database(self) -> None:
-        result = _run_cli("sqlite:///:memory:", "--list")
+        result = _run_cli("--list")
 
         assert result.returncode == 0, result.stderr
         assert "SC-01  DRAFT_AWAITING_HUMAN_REVIEW" in result.stdout
