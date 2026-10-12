@@ -208,6 +208,41 @@ contract-only item with no list price, a customer on credit hold, a deactivated
 account, a stock line with nothing available but stock inbound, and one part
 number that genuinely resolves to two products.
 
+## The RFQ-to-DRAFT demo (Phase 1M-C)
+
+```bash
+make migrate && make seed && make demo   # or: python -m rfq_agent.demo [--url URL]
+```
+
+The demo is the whole accepted chain run by hand against the seeded database,
+three times over — no pytest, no live model. Each scenario is a typed,
+versioned fixture in `src/rfq_agent/demo/fixtures.py` that states what only a
+caller may state (the untrusted intake, the extraction *claims* an LLM would
+have produced, identifiers, instants); every rule-bound step is the accepted
+components' own: customer binding and line resolution (Phase 1M-B), the quote
+request adapter (Phase 1M-A), the deterministic quote run (Phase 1L) and the
+atomic write path (Phase 1J'). The fixtures assert no business verdicts — the
+claims' status fields are ignored exactly like model output — and the demo
+fails loudly if a run stops matching its fixture's declared outcome.
+
+* **SC-01** binds the sender by a stored e-mail alias, resolves the customer
+  part number, prices 40 pumps at Nordwind's contract rate and persists the
+  DRAFT — `DRAFT_AWAITING_HUMAN_REVIEW`.
+* **SC-02** asks for `PMP-A-100`, the seeded collision: the line is
+  `AMBIGUOUS`, the adapter refuses to map it, and nothing is quoted or stored —
+  `HUMAN_REQUIRED_BEFORE_QUOTE`.
+* **SC-03** is a sender no stored identity proves (a fixture-stated operator
+  binding, the adapter contract's human path), priced from the public list,
+  whose credit hold becomes stored blocking evidence — `DRAFT_BLOCKED`.
+
+Re-running the demo recognises its own work: the provisioned RFQ/run rows are
+reused (a conflicting row under a fixture identifier is refused, never
+overwritten) and the identical quote write reports `DUPLICATE`. Limits, stated
+plainly: no quote is ever approved or sent, no run changes state, and the gate
+decision printed on stdout is never stored. The command requires an already
+migrated and seeded database and prepares neither — missing schema or dataset
+is reported as the command that fixes it (exit 2).
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Every variable is prefixed `RFQ_`; nested

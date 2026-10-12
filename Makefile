@@ -11,7 +11,7 @@ PYTEST    := $(VENV)/bin/pytest
 PYTHON_VERSION ?= 3.13
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install lint format test check autofix clean migrate seed seed-reset
+.PHONY: help venv install lint format test check autofix clean migrate seed seed-reset demo
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -45,6 +45,9 @@ seed: ## Write the demo business dataset (idempotent; safe to re-run)
 
 seed-reset: ## Delete the demo dataset rows and write them again from scratch
 	$(PY) -m rfq_agent.seed --reset
+
+demo: ## Run the fixture-driven RFQ-to-DRAFT demo (needs a migrated, seeded DB)
+	$(PY) -m rfq_agent.demo
 
 check: lint test ## Full Phase 0 exit check
 

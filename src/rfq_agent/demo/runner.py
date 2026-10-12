@@ -1,0 +1,252 @@
+"""The demonstration pipeline: one fixture scenario, one reported outcome (Phase 1M-C).
+
+This module composes the accepted components and decides nothing on its own:
+
+#. the provisioning shim gets-or-creates the fixture-stated RFQ and run rows;
+#. Phase 1M-B's :func:`~rfq_agent.resolving.bind_customer` rules on the sender
+   and :func:`~rfq_agent.resolving.resolve_lines` rules on the claimed lines;
+#. Phase 1M-A's :func:`~rfq_agent.quote_adapter.to_quote_request` assembles the
+   request - and its refusals are this demo's "a human is needed" outcomes;
+#. Phase 1L's :func:`~rfq_agent.quoting.run_quote` decides over the business
+   data, and Phase 1J''s ``QuoteWriter`` stores the accepted artefacts.
+
+Where each responsibility lives, so a reviewer can hold this module to its
+boundary:
+
+* **no business rules.** Nothing here prices, resolves, gates or approves -
+  every verdict is the accepted function's own. The runner only classifies the
+  run's outcome into the four demonstration outcomes, coarse enough to carry
+  no rule: evidence exists or it does not, the gate is eligible or it is not;
+* **the human seam is stated, never simulated by the code.** When a fixture
+  carries ``human_binding``, the runner records the operator's decision in the
+  contract's own terms (a non-``EXACT`` status the evidence supports, source
+  ``HUMAN``) and the 1M-A adapter's quotability rule does the rest. A binding
+  that contradicts the search evidence is a fixture defect, not a decision;
+* **the demo checks itself.** A run whose outcome class disagrees with the
+  fixture's declared ``expected`` raises :class:`DemoError` - a demo that has
+  drifted from the accepted behaviour must fail, not narrate;
+* **the read boundary only reads.** The ``BusinessReader`` session is never
+  committed by this module; the only writes are the provisioning shim's two
+  rows and ``QuoteWriter``'s accepted unit of work.
+
+Nothing here approves, sends, transitions a run, or stores a gate decision -
+the gate's verdict is reported on stdout and nowhere else.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from rfq_agent.demo.errors import DemoError
+from rfq_agent.demo.fixtures import DemoOutcome, DemoScenario
+from rfq_agent.demo.intake import provision_run
+from rfq_agent.domain.resolution import (
+    CustomerMatchStatus,
+    ResolutionSource,
+    ResolvedCustomer,
+    ResolvedLine,
+)
+from rfq_agent.persistence.repositories import BusinessReader
+from rfq_agent.persistence.writers import QuoteWriter
+from rfq_agent.quote_adapter import to_quote_request
+from rfq_agent.quoting import QuoteRunStatus, run_quote
+from rfq_agent.resolving import bind_customer, resolve_lines
+
+if TYPE_CHECKING:
+    from rfq_agent.persistence.engine import Database
+    from rfq_agent.persistence.read_models import CustomerSearch
+    from rfq_agent.persistence.writers import QuoteWriteResult
+    from rfq_agent.quoting import QuoteRunResult
+
+__all__ = ["ScenarioReport", "run_scenario"]
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioReport:
+    """Everything one scenario run established, ready for the command to print.
+
+    ``result`` and ``write`` are absent exactly when the run stopped before
+    quoting: the report of a ``HUMAN_REQUIRED_BEFORE_QUOTE`` scenario is its
+    binding and line evidence plus the stop reason, and there is no quote to
+    show - by construction, none was prepared or stored.
+    """
+
+    scenario: DemoScenario
+    outcome: DemoOutcome
+    #: One sentence on how the customer was (or was not) bound.
+    customer_summary: str
+    #: One sentence per claimed line: the resolution core's ruling and reason.
+    line_summaries: tuple[str, ...]
+    #: Why the run stopped before quoting, when it did.
+    stop_reason: str | None = None
+    #: The deterministic run's own artefacts, when it completed.
+    result: QuoteRunResult | None = None
+    #: What the write path stored - or found already stored.
+    write: QuoteWriteResult | None = None
+
+
+def run_scenario(scenario: DemoScenario, database: Database) -> ScenarioReport:
+    """Run one fixture scenario through the accepted chain and report it.
+
+    Args:
+        scenario: The fixture: untrusted intake, extraction claims, stated
+            identifiers and instants, and the declared outcome.
+        database: The prepared database (migrated and seeded). The scenario's
+            RFQ and run rows are provisioned here; the resolved facts are read
+            here; the accepted write path persists here.
+
+    Returns:
+        The report the command prints: binding evidence, line rulings, the
+        run's artefacts (when it completed) and one of the four demo outcomes.
+
+    Raises:
+        DemoError: When the fixture's stated human binding contradicts the
+            search evidence, or when the run's outcome class is not the one
+            the fixture declared - the demo no longer matches the behaviour it
+            claims to demonstrate.
+    """
+    with database.session() as session:
+        provision_run(session, scenario)
+
+    with database.session_factory() as read_session:
+        reader = BusinessReader.for_session(read_session)
+        customer, search = bind_customer(scenario.sender_email, reader=reader)
+        customer, customer_summary = _customer_for_quote(scenario, customer, search)
+        lines = resolve_lines(scenario.lines, line_item_ids=scenario.line_item_ids, reader=reader)
+        line_summaries = tuple(_line_summary(line) for line in lines)
+        try:
+            request = to_quote_request(
+                customer,
+                lines,
+                run_id=scenario.run_id,
+                quote_id=scenario.quote_id,
+                quote_number=scenario.quote_number,
+                pricing_as_of=scenario.pricing_as_of,
+                stock_as_of=scenario.stock_as_of,
+                requested_delivery=scenario.requested_delivery,
+                delivery_as_of=scenario.delivery_as_of,
+            )
+        except ValueError as error:
+            return _stopped(scenario, customer_summary, line_summaries, str(error))
+        result = run_quote(request, reader)
+        if result.status is not QuoteRunStatus.COMPLETED:
+            return _stopped(scenario, customer_summary, line_summaries, result.detail)
+
+    fresh = _classify(result)
+    if fresh is not scenario.expected:
+        msg = (
+            f"scenario {scenario.scenario_id}: the fixture declares {scenario.expected} but "
+            f"the run produced {fresh}: the demo no longer matches the accepted behaviour"
+        )
+        raise DemoError(msg)
+    write = QuoteWriter(database).persist(result.calculation, result.ledger)  # type: ignore[arg-type]
+    return ScenarioReport(
+        scenario=scenario,
+        outcome=DemoOutcome.DUPLICATE if write.duplicate else fresh,
+        customer_summary=customer_summary,
+        line_summaries=line_summaries,
+        result=result,
+        write=write,
+    )
+
+
+def _customer_for_quote(
+    scenario: DemoScenario,
+    customer: ResolvedCustomer,
+    search: CustomerSearch,
+) -> tuple[ResolvedCustomer, str]:
+    """Apply the contract's binding rule to what the resolution core ruled.
+
+    An ``EXACT`` ruling stands as it is. Anything else reaches quoting only
+    through the contract's own human path: the fixture's stated
+    ``human_binding`` - checked against the search evidence, never against the
+    runner's opinion - or the adapter's refusal a few lines later.
+    """
+    if customer.match_status is CustomerMatchStatus.EXACT:
+        summary = (
+            f"EXACT identity: {customer.customer_id} - the sender's address is a stored "
+            "e-mail alias of exactly one active customer"
+        )
+        return customer, summary
+    binding = scenario.human_binding
+    if binding is None:
+        if customer.match_status is CustomerMatchStatus.UNBOUND:
+            summary = (
+                "UNBOUND: no stored alias or name proves who this sender is - "
+                "a human must bind the customer"
+            )
+        else:
+            summary = (
+                f"{customer.match_status} ({customer.customer_id}): evidence, not proven "
+                "identity - a human must confirm before pricing may proceed"
+            )
+        return customer, summary
+    if search.matched_ids and binding not in search.matched_ids:
+        found = ", ".join(search.matched_ids)
+        msg = (
+            f"scenario {scenario.scenario_id}: the fixture's human binding {binding!r} "
+            f"contradicts the search evidence ({found}): stating a different customer would "
+            "be inventing, not deciding - fix the fixture"
+        )
+        raise DemoError(msg)
+    if not search.matched_ids:
+        status = CustomerMatchStatus.NO_MATCH
+    elif len(search.matched_ids) == 1:
+        status = CustomerMatchStatus.SINGLE_CANDIDATE
+    else:
+        status = CustomerMatchStatus.AMBIGUOUS
+    bound = ResolvedCustomer(
+        customer_id=binding,
+        match_status=status,
+        source=ResolutionSource.HUMAN,
+    )
+    summary = (
+        f"{status}: the data alone cannot bind this sender - the operator bound {binding} "
+        "(a fixture-stated human decision, source HUMAN)"
+    )
+    return bound, summary
+
+
+def _line_summary(line: ResolvedLine) -> str:
+    """One sentence with the resolution core's ruling for one claimed line."""
+    reason = f" - {line.resolution_reason}" if line.resolution_reason else ""
+    if line.product_id is not None and line.sku is not None:
+        return f"{line.status} {line.sku} ({line.product_id}){reason}"
+    return f"{line.status}{reason}"
+
+
+def _classify(result: QuoteRunResult) -> DemoOutcome:
+    """The persisted outcome of a completed run, coarse enough to hold no rule.
+
+    Blocking evidence in the projected ledger - or a gate that finds the quote
+    ineligible for human review - is a blocked draft. Anything else is a clean
+    draft awaiting the human every V1 quote awaits.
+    """
+    ledger = result.ledger
+    if (ledger is not None and ledger.reasons) or not result.eligible_for_human_review:
+        return DemoOutcome.DRAFT_BLOCKED
+    return DemoOutcome.DRAFT_AWAITING_HUMAN_REVIEW
+
+
+def _stopped(
+    scenario: DemoScenario,
+    customer_summary: str,
+    line_summaries: tuple[str, ...],
+    stop_reason: str,
+) -> ScenarioReport:
+    """Report a run that stopped before quoting - and check the fixture knew."""
+    if scenario.expected is not DemoOutcome.HUMAN_REQUIRED_BEFORE_QUOTE:
+        msg = (
+            f"scenario {scenario.scenario_id}: the fixture declares {scenario.expected} but "
+            f"the run stopped before quoting ({stop_reason}): the demo no longer matches "
+            "the accepted behaviour"
+        )
+        raise DemoError(msg)
+    return ScenarioReport(
+        scenario=scenario,
+        outcome=DemoOutcome.HUMAN_REQUIRED_BEFORE_QUOTE,
+        customer_summary=customer_summary,
+        line_summaries=line_summaries,
+        stop_reason=stop_reason,
+    )
