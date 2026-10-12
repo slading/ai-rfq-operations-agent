@@ -1,17 +1,14 @@
 """Command line entry point: ``python -m rfq_agent.demo [--url URL] [--scenario SC-NN]``.
 
-The human-runnable form of the Phase 1M-C demonstration: each fixture scenario
-is walked through the accepted RFQ-to-DRAFT chain against a database that is
-already migrated and seeded, and what happened is printed - the customer
-binding, the line rulings, the quote as the deterministic run calculated it,
-the gate's (never stored) verdict, and what the write path persisted.
+Each fixture scenario is walked through the accepted RFQ-to-DRAFT chain
+against an already migrated and seeded database; the report prints the
+binding, the line rulings, the calculated quote, the gate's (never stored)
+verdict, and what the write path persisted. The command writes only through
+the accepted ``QuoteWriter``: it approves nothing, sends nothing, transitions
+no run.
 
-The command writes quotes only through the accepted ``QuoteWriter``. It never
-runs migrations, never writes the business dataset, approves nothing, sends
-nothing and transitions no run. Exit codes: ``0`` every selected scenario
-reached its declared outcome, ``2`` anything else - a missing schema or
-dataset, an unknown scenario, a fixture contradiction - reported on stderr as
-an instruction, not a traceback.
+Exit codes: ``0`` every selected scenario reached its declared outcome, ``2``
+anything else - reported on stderr as an instruction, not a traceback.
 """
 
 from __future__ import annotations
@@ -102,9 +99,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.scenario
             else list(SCENARIOS)
         )
-        # The default URL resolves exactly as the runtime and alembic resolve
-        # theirs (Settings.load reads RFQ_* and .env): migration and demo can
-        # never silently target different databases.
+        # The default URL resolves exactly as alembic's does (Settings.load
+        # reads RFQ_* and .env): migration and demo always target one database.
         database = Database.create(args.url or Settings.load().database.url)
         try:
             with database.session() as session:
@@ -191,12 +187,7 @@ def _format_report(report: ScenarioReport) -> str:
 def _require_artefacts(
     report: ScenarioReport,
 ) -> tuple[QuoteRunResult, QuoteWriteResult, Quote, PolicyGateDecision, QuoteBlockedLedger]:
-    """The completed run's artefacts; an absent one means the reporter lied.
-
-    The runner only ever builds such a report from a ``COMPLETED`` run, whose
-    own contract guarantees every artefact - the guard turns a future
-    construction mistake into a demo failure instead of a traceback.
-    """
+    """The completed run's artefacts; a ``COMPLETED`` run guarantees each one."""
     result = report.result
     write = report.write
     quote = result.quote if result is not None else None

@@ -1,32 +1,21 @@
-"""Demo-scoped provisioning: the RFQ and run rows a persisted quote needs (Phase 1M-C).
+"""Provisioning shim: the RFQ and run rows a persisted quote needs (Phase 1M-C).
 
 ``QuoteWriter`` stores a quote only against an existing run, and a run only
-against an existing RFQ ("a quote cannot be stored without one"). No accepted
-phase owns an intake write path yet - the persistence tests create these rows
-with factories in ``tests/``, which production code must not import. This shim
-is the smallest demo-scoped stand-in: it writes exactly the two rows the
-fixture states, or recognises them when they are already there.
+against an existing RFQ. No accepted phase owns an intake write path yet, and
+production code must not import the test factories - this shim is the smallest
+demo-scoped stand-in, to be replaced by the phase that owns real intake.
 
-Three rules keep it honest:
+The rules it enforces:
 
-* **get-or-create, never create-or-fail.** Re-running the demo on the same
-  database finds its own rows and continues - which is also what lets the
-  ``DUPLICATE`` outcome be demonstrated at the quote layer.
+* **get-or-create.** A re-run finds its own rows and continues - which is also
+  what lets the ``DUPLICATE`` outcome be demonstrated at the quote layer.
 * **identical means identical.** A stored row is reused only when *every*
-  fixture-owned field matches: for the RFQ the intake content (sender identity,
-  subject, body and its hash, channel, status, received instant, key, metadata),
-  for the run its entire initial lifecycle (parent RFQ, attempt number,
-  trigger, state, instants and the untouched lifecycle fields). A row under a
-  fixture identifier that differs anywhere is refused, field names stated -
-  never overwritten (the intake audit model is append-only by design, and a
-  run the demo did not leave in ``RECEIVED`` is not the demo's run).
-* **everything is stated by the fixture.** The RFQ's stored hashes are pure
-  functions of the fixture's untrusted text (:func:`sha256_text`), and both
-  rows take their instants from the fixture - no clock is read here.
-
-This is scaffolding for the demonstration only: the phase that owns real
-intake persistence will replace it. It transitions nothing - the run stays
-``RECEIVED``, exactly as the accepted write path leaves it.
+  fixture-owned field matches; any difference under a fixture identifier is
+  refused, differing fields named, never overwritten (intake history is
+  append-only, and a run the demo did not leave in ``RECEIVED`` is not the
+  demo's run).
+* **nothing is invented.** Stored hashes are :func:`sha256_text` of the
+  fixture's untrusted text; every instant comes from the fixture - no clock.
 """
 
 from __future__ import annotations
@@ -85,16 +74,13 @@ _RUN_CONTENT_FIELDS: tuple[str, ...] = (
 
 
 def require_prerequisites(session: Session) -> None:
-    """Raise :class:`DemoError` unless the database is ready to demonstrate on.
+    """Refuse unless the database is migrated and seeded, naming the fix command.
 
-    The demo requires an already migrated and seeded database - it never runs
-    migrations or writes business data itself. Both failures are reported as
-    the command that fixes them.
+    The demo never runs migrations or writes the business dataset itself.
 
     Raises:
-        DemoError: When the schema has not been migrated (run
-            ``alembic upgrade head``) or the demo dataset has not been written
-            (run ``make seed``).
+        DemoError: When the schema is missing (run ``alembic upgrade head``)
+            or the dataset is missing (run ``make seed``).
     """
     try:
         require_schema(session)
@@ -111,19 +97,16 @@ def require_prerequisites(session: Session) -> None:
 def provision_run(session: Session, scenario: DemoScenario) -> None:
     """Get-or-create the RFQ and run rows ``scenario`` states.
 
-    An existing pair is reused only when every fixture-owned field is
-    identical to what the fixture states. A row under a fixture identifier
-    with any difference - another sender, another subject, a lifecycle that
-    moved past ``RECEIVED`` - is a contradiction the demo refuses rather than
-    modifies.
+    A stored row is reused only when every fixture-owned field is identical;
+    a fixture identifier holding different content is a refusal, never an
+    overwrite.
 
     Args:
         session: The unit of work both rows are written in. The caller commits.
         scenario: The fixture stating every identifier and instant.
 
     Raises:
-        DemoError: When a stored row under a fixture identifier differs from
-            the fixture in any owned field. The differing fields are named.
+        DemoError: On any differing field in a stored row; the fields are named.
     """
     rfq = session.get(RfqRow, scenario.rfq_id)
     if rfq is None:
@@ -149,11 +132,10 @@ def _require_identical(
     kind: str,
     identifier: str,
 ) -> None:
-    """Refuse when the stored row is not the row the fixture states.
+    """Refuse a stored row that is not field-for-field the fixture's own.
 
-    Not a lookup rule: the demo's identifiers pin *content*, so a stored row
-    that is not field-for-field the fixture's own is a different history the
-    demonstration must not silently join - and must never rewrite.
+    The demo's identifiers pin *content*: a differing row is a different
+    history the demonstration must not silently join - and must never rewrite.
     """
     mismatches = [name for name in fields if getattr(stored, name) != getattr(expected, name)]
     if mismatches:

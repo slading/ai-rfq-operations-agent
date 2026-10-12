@@ -1,35 +1,18 @@
 """The demonstration fixtures: versioned literals, never generated (Phase 1M-C).
 
-A scenario is everything the deterministic pipeline needs stated outright,
-and nothing more: the untrusted intake (sender, subject, body), the
-*extraction claims* an LLM would have produced from it (trust tier T3 - they
-assert nothing the deterministic core does not re-derive), the identifiers and
-instants only a caller may hold, and the outcome the demonstration declares it
-will produce. This module follows the same discipline as
-:mod:`rfq_agent.seed.dataset`: every value is a literal, there is no clock and
-no randomness, so a scenario plus :data:`rfq_agent.seed.SEED_VERSION` is a
-reproducible artefact.
+A scenario states everything the deterministic pipeline needs outright: the
+untrusted intake, the *extraction claims* an LLM would have produced from it
+(trust tier T3 - the resolution core re-derives everything, exactly like
+model output), the identifiers and instants only a caller may hold, and the
+outcome the run must produce. Following :mod:`rfq_agent.seed.dataset`'s
+discipline there is no clock and no randomness, so a scenario plus
+:data:`rfq_agent.seed.SEED_VERSION` is a reproducible artefact.
 
-What a fixture is **not**: a source of business verdicts. ``lines`` are
-:class:`~rfq_agent.domain.extraction.ExtractedLine` claims whose own
-``status`` and ``confidence`` are ignored by the resolution core, exactly like
-model output. ``human_binding`` is the one caller-state a fixture may make
-beyond the claims: the record that an operator bound a sender to a customer
-(:class:`~rfq_agent.domain.resolution.ResolutionSource` ``HUMAN``), which the
-1M-A adapter's contract already accepts. ``expected`` is the demonstration's
-own self-check - the runner refuses to continue when reality disagrees, so a
-demo that drifts from the accepted behaviour fails loudly.
-
-Three scenarios exist, no more:
-
-#. ``SC-01`` - an e-mail-proven identity, one resolved line, a priced and
-   persisted draft awaiting a human: ``DRAFT_AWAITING_HUMAN_REVIEW``.
-#. ``SC-02`` - the seeded ``PMP-A-100`` collision: one SKU, two products, so
-   the line requires a person before any quote exists:
-   ``HUMAN_REQUIRED_BEFORE_QUOTE``.
-#. ``SC-03`` - a sender no stored identity proves, bound by an operator, whose
-   account is on credit hold: the draft is calculated and stored with its
-   blocking evidence, and is never eligible: ``DRAFT_BLOCKED``.
+Two fields carry self-contained guarantees: ``human_binding`` is the one
+caller-state a fixture may make beyond the claims - the record that an
+operator bound a sender to a customer, which the 1M-A adapter's contract
+already accepts - and ``expected`` is the demonstration's self-check: a run
+that drifts from the accepted behaviour must fail, not narrate.
 """
 
 from __future__ import annotations
@@ -80,13 +63,7 @@ class DemoOutcome(StrEnum):
 
 
 class DemoScenario(DomainModel):
-    """One fixture-driven demonstration of the RFQ-to-DRAFT chain.
-
-    The intake fields (``sender_email``, ``subject``, ``body``) are stored
-    verbatim by the provisioning shim. ``lines`` and ``requested_delivery``
-    are the claims the extraction stage would have emitted. Everything else is
-    caller-stated: identifiers, instants and the outcome the run must produce.
-    """
+    """One fixture scenario: intake, claims, identifiers and outcome stated outright."""
 
     scenario_id: Annotated[str, StringConstraints(pattern=r"^SC-[0-9]{2}$")]
     #: One sentence shown as the scenario's heading.
@@ -167,11 +144,7 @@ class DemoScenario(DomainModel):
 
 
 def scenario_by_id(scenario_id: str) -> DemoScenario:
-    """Return the scenario ``scenario_id`` names, or refuse with the known ids.
-
-    Raises:
-        DemoError: When the id is not one of the declared scenarios.
-    """
+    """Return the named scenario; unknown ids fail with the declared list."""
     for scenario in SCENARIOS:
         if scenario.scenario_id == scenario_id:
             return scenario
@@ -185,10 +158,9 @@ def scenario_by_id(scenario_id: str) -> DemoScenario:
 # ---------------------------------------------------------------------------
 
 SCENARIOS: tuple[DemoScenario, ...] = (
-    # SC-01 - the happy path: the stored e-mail alias proves the sender is
-    # Nordwind (CUS_0001), the customer part number 100-ABC resolves to one
-    # catalogue item, and the run prices 40 pumps at Nordwind's contract rate.
-    # The customer stated no delivery facts, so none are computed or invented.
+    # SC-01 - the happy path: a stored e-mail alias proves Nordwind (CUS_0001),
+    # one catalogue line resolves, 40 pumps price at the contract rate. No
+    # delivery facts were stated, so none are computed or invented.
     DemoScenario(
         scenario_id="SC-01",
         title="Nordwind orders 40 pumps: identity proven, line resolved, draft persists",
@@ -221,8 +193,7 @@ SCENARIOS: tuple[DemoScenario, ...] = (
     ),
     # SC-02 - the seeded collision: "PMP-A-100" is one product's SKU and the
     # stainless variant's stored name, so resolution returns AMBIGUOUS and the
-    # 1M-A adapter refuses to map the line. A human must choose; no quote, no
-    # rows beyond the provisioned intake.
+    # adapter refuses the line: a human must choose before any quote exists.
     DemoScenario(
         scenario_id="SC-02",
         title="The PMP-A-100 collision: an ambiguous line stops before any quote",
@@ -252,10 +223,10 @@ SCENARIOS: tuple[DemoScenario, ...] = (
         quote_number="Q-2026-8002",
         line_item_ids=("LI_DEMO_0002",),
     ),
-    # SC-03 - the sender's domain is stored for Nordic Kraft (CUS_0007) but no
+    # SC-03 - the sender's domain points at Nordic Kraft (CUS_0007) but no
     # full-address identity proves them, so the fixture states the operator's
-    # binding decision. The line resolves and prices at the public list, and
-    # the account's credit hold becomes stored blocking evidence.
+    # binding. The line prices at the public list and the account's credit
+    # hold becomes stored blocking evidence.
     DemoScenario(
         scenario_id="SC-03",
         title="Nordic Kraft on credit hold: the blocked draft persists as evidence",

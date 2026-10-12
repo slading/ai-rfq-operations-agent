@@ -1,33 +1,24 @@
-"""The demonstration pipeline: one fixture scenario, one reported outcome (Phase 1M-C).
+"""The demonstration pipeline: compose the accepted components, decide nothing.
 
-This module composes the accepted components and decides nothing on its own:
+One scenario run: the provisioning shim gets-or-creates the fixture-stated RFQ
+and run rows; 1M-B's ``bind_customer``/``resolve_lines`` rule over the
+untrusted intake and the claims; 1M-A's ``to_quote_request`` assembles the
+request (its refusals are the "a human is needed" outcomes); 1L's quote run
+decides over the business data and 1J''s ``QuoteWriter`` stores the accepted
+artefacts. Outcomes are coarseness-classified into the four demo outcomes -
+coarse enough to carry no rule: evidence exists or it does not, the gate is
+eligible or it is not.
 
-#. the provisioning shim gets-or-creates the fixture-stated RFQ and run rows;
-#. Phase 1M-B's :func:`~rfq_agent.resolving.bind_customer` rules on the sender
-   and :func:`~rfq_agent.resolving.resolve_lines` rules on the claimed lines;
-#. Phase 1M-A's :func:`~rfq_agent.quote_adapter.to_quote_request` assembles the
-   request - and its refusals are this demo's "a human is needed" outcomes;
-#. Phase 1L's :func:`~rfq_agent.quoting.run_quote` decides over the business
-   data, and Phase 1J''s ``QuoteWriter`` stores the accepted artefacts.
+Boundaries this module is held to:
 
-Where each responsibility lives, so a reviewer can hold this module to its
-boundary:
-
-* **no business rules.** Nothing here prices, resolves, gates or approves -
-  every verdict is the accepted function's own. The runner only classifies the
-  run's outcome into the four demonstration outcomes, coarse enough to carry
-  no rule: evidence exists or it does not, the gate is eligible or it is not;
-* **the human seam is stated, never simulated by the code.** When a fixture
-  carries ``human_binding``, the runner records the operator's decision in the
-  contract's own terms (a non-``EXACT`` status the evidence supports, source
-  ``HUMAN``) and the 1M-A adapter's quotability rule does the rest. A binding
-  that contradicts the search evidence is a fixture defect, not a decision;
-* **the demo checks itself.** A run whose outcome class disagrees with the
-  fixture's declared ``expected`` raises :class:`DemoError` - a demo that has
-  drifted from the accepted behaviour must fail, not narrate;
-* **the read boundary only reads.** The ``BusinessReader`` session is never
-  committed by this module; the only writes are the provisioning shim's two
-  rows and ``QuoteWriter``'s accepted unit of work.
+* **no business rules.** Every verdict is an accepted function's own.
+* **the human seam is stated, never simulated.** A fixture's ``human_binding``
+  becomes a ``ResolutionSource.HUMAN`` binding checked against the search
+  evidence; a contradiction is a fixture defect, not a decision.
+* **the demo checks itself.** An outcome class disagreeing with the fixture's
+  declared ``expected`` is a failure, not a narrative.
+* **the read boundary only reads.** The only writes are the shim's two rows
+  and the accepted write path's unit of work.
 
 Nothing here approves, sends, transitions a run, or stores a gate decision -
 the gate's verdict is reported on stdout and nowhere else.
@@ -67,9 +58,7 @@ class ScenarioReport:
     """Everything one scenario run established, ready for the command to print.
 
     ``result`` and ``write`` are absent exactly when the run stopped before
-    quoting: the report of a ``HUMAN_REQUIRED_BEFORE_QUOTE`` scenario is its
-    binding and line evidence plus the stop reason, and there is no quote to
-    show - by construction, none was prepared or stored.
+    quoting: by construction, nothing was prepared or stored.
     """
 
     scenario: DemoScenario
@@ -90,21 +79,13 @@ def run_scenario(scenario: DemoScenario, database: Database) -> ScenarioReport:
     """Run one fixture scenario through the accepted chain and report it.
 
     Args:
-        scenario: The fixture: untrusted intake, extraction claims, stated
-            identifiers and instants, and the declared outcome.
-        database: The prepared database (migrated and seeded). The scenario's
-            RFQ and run rows are provisioned here; the resolved facts are read
-            here; the accepted write path persists here.
-
-    Returns:
-        The report the command prints: binding evidence, line rulings, the
-        run's artefacts (when it completed) and one of the four demo outcomes.
+        scenario: The fixture: intake, claims, identifiers, declared outcome.
+        database: The prepared (migrated and seeded) database to provision
+            into, read through, and write the accepted artefacts to.
 
     Raises:
-        DemoError: When the fixture's stated human binding contradicts the
-            search evidence, or when the run's outcome class is not the one
-            the fixture declared - the demo no longer matches the behaviour it
-            claims to demonstrate.
+        DemoError: When the fixture's human binding contradicts the search
+            evidence, or the run's outcome class is not the declared one.
     """
     with database.session() as session:
         provision_run(session, scenario)
@@ -158,10 +139,9 @@ def _customer_for_quote(
 ) -> tuple[ResolvedCustomer, str]:
     """Apply the contract's binding rule to what the resolution core ruled.
 
-    An ``EXACT`` ruling stands as it is. Anything else reaches quoting only
-    through the contract's own human path: the fixture's stated
-    ``human_binding`` - checked against the search evidence, never against the
-    runner's opinion - or the adapter's refusal a few lines later.
+    An ``EXACT`` ruling stands; anything else reaches quoting only via the
+    contract's human path - the fixture's stated ``human_binding``, checked
+    against the search evidence - or fails at the adapter.
     """
     if customer.match_status is CustomerMatchStatus.EXACT:
         summary = (
@@ -219,9 +199,9 @@ def _line_summary(line: ResolvedLine) -> str:
 def _classify(result: QuoteRunResult) -> DemoOutcome:
     """The persisted outcome of a completed run, coarse enough to hold no rule.
 
-    Blocking evidence in the projected ledger - or a gate that finds the quote
-    ineligible for human review - is a blocked draft. Anything else is a clean
-    draft awaiting the human every V1 quote awaits.
+    Blocking evidence - or a gate finding the quote ineligible for human
+    review - is a blocked draft; anything else awaits the human every V1
+    quote awaits.
     """
     ledger = result.ledger
     if (ledger is not None and ledger.reasons) or not result.eligible_for_human_review:
