@@ -72,6 +72,28 @@ def fixture_run_row(**overrides: object) -> RunRow:
 
 
 class TestProvisionRun:
+    def test_returned_snapshot_is_the_same_source_as_the_stored_rfq_and_run(
+        self, session: Session
+    ) -> None:
+        source = provision_run(session, SCENARIO)
+        session.commit()
+        stored = session.get(RfqRow, SCENARIO.rfq_id)
+        run = session.get(RunRow, SCENARIO.run_id)
+        assert source.body.text == stored.body_text
+        assert source.body.sha256 == stored.body_sha256 == sha256_text(SCENARIO.body)
+        assert source.body.truncated is False
+        assert source.subject == stored.subject
+        assert source.sender_name == stored.sender_name
+        assert source.sender_email == stored.sender_email
+        assert source.sender_email_hash == stored.sender_email_hash
+        assert source.source_channel == stored.source_channel
+        assert source.received_at == stored.received_at
+        assert source.idempotency_key == stored.idempotency_key
+        assert source.thread_key == stored.thread_key
+        assert source.attachments == ()
+        assert run.rfq_id == stored.rfq_id
+        assert provision_run(session, SCENARIO) == source
+
     def test_it_writes_the_fixture_rows_verbatim(self, session: Session) -> None:
         provision_run(session, SCENARIO)
 

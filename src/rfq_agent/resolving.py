@@ -232,6 +232,8 @@ def _resolve_line(
         extracted=extracted,
         product_id=product_id,
         sku=product.sku,
+        catalog_name=product.name,
+        catalog_uom=product.uom,
         status=ResolutionMatchStatus.RESOLVED,
         source=ResolutionSource.SYSTEM,
         resolution_reason=", ".join(evidence),

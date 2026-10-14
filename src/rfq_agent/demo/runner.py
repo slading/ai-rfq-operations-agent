@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from rfq_agent.demo.errors import DemoError
 from rfq_agent.demo.fixtures import DemoOutcome, DemoScenario
 from rfq_agent.demo.intake import provision_run
+from rfq_agent.domain.extraction import ExtractionResult, RequestedDelivery
 from rfq_agent.domain.resolution import (
     CustomerMatchStatus,
     ResolutionSource,
@@ -88,11 +89,11 @@ def run_scenario(scenario: DemoScenario, database: Database) -> ScenarioReport:
             evidence, or the run's outcome class is not the declared one.
     """
     with database.session() as session:
-        provision_run(session, scenario)
+        source = provision_run(session, scenario)
 
     with database.session_factory() as read_session:
         reader = BusinessReader.for_session(read_session)
-        customer, search = bind_customer(scenario.sender_email, reader=reader)
+        customer, search = bind_customer(source.sender_email, reader=reader)
         customer, customer_summary = _customer_for_quote(scenario, customer, search)
         lines = resolve_lines(scenario.lines, line_item_ids=scenario.line_item_ids, reader=reader)
         line_summaries = tuple(_line_summary(line) for line in lines)
@@ -100,6 +101,11 @@ def run_scenario(scenario: DemoScenario, database: Database) -> ScenarioReport:
             request = to_quote_request(
                 customer,
                 lines,
+                source=source,
+                extraction=ExtractionResult(
+                    lines=scenario.lines,
+                    requested_delivery=scenario.requested_delivery or RequestedDelivery(),
+                ),
                 run_id=scenario.run_id,
                 quote_id=scenario.quote_id,
                 quote_number=scenario.quote_number,

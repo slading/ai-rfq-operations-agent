@@ -133,6 +133,12 @@ class GroundingErrorCode(StrEnum):
     DUPLICATE_LINE_ORDINAL = "DUPLICATE_LINE_ORDINAL"
     STATUS_CLAIMED_BY_MODEL = "STATUS_CLAIMED_BY_MODEL"
     CANDIDATE_LIMIT_EXCEEDED = "CANDIDATE_LIMIT_EXCEEDED"
+    SOURCE_UNSUPPORTED = "SOURCE_UNSUPPORTED"
+    SOURCE_CONTRADICTORY = "SOURCE_CONTRADICTORY"
+    EXTRACTION_INCONSISTENT = "EXTRACTION_INCONSISTENT"
+    QUANTITY_UNSUPPORTED = "QUANTITY_UNSUPPORTED"
+    UNIT_UNSUPPORTED = "UNIT_UNSUPPORTED"
+    UNIT_MISMATCH = "UNIT_MISMATCH"
 
 
 class CustomerCandidate(DomainModel):
@@ -456,11 +462,13 @@ class ResolvedCustomer(DomainModel):
 
 
 class ResolvedLine(DomainModel):
-    """A line after deterministic resolution: this is a fact, not a claim."""
+    """Product identity after resolution; embedded extraction remains a claim."""
 
     line_item_id: LineItemId
     ordinal: Annotated[int, Field(ge=1)]
     extracted: ExtractedLine
+    catalog_name: Annotated[str, StringConstraints(min_length=1, max_length=200)] | None = None
+    catalog_uom: Annotated[str, StringConstraints(min_length=1, max_length=16)] | None = None
     product_id: ProductId | None = None
     sku: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
     status: ResolutionMatchStatus = ResolutionMatchStatus.UNMATCHED
@@ -479,6 +487,11 @@ class ResolvedLine(DomainModel):
             if self.source is None:
                 msg = "source is required for a resolved line"
                 raise ValueError(msg)
+        if self.status is ResolutionMatchStatus.RESOLVED and (
+            self.catalog_name is None or self.catalog_uom is None
+        ):
+            msg = "catalog_name and catalog_uom are required for a resolved line"
+            raise ValueError(msg)
         if self.status in BLOCKING_LINE_STATUSES and self.source is not None:
             msg = "a blocking line has not been resolved, so it must have no source"
             raise ValueError(msg)

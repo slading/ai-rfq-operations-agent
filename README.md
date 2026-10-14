@@ -255,6 +255,101 @@ explicitly to both `python -m rfq_agent.seed` and `python -m rfq_agent.demo`.
 Unifying the seed command with the same one-line resolution is a documented
 follow-up, not part of this phase.
 
+## F1/F2 quotation trust boundary
+
+**Business invariant (explicitly approved policy).** `ProductRecord.uom` is the
+canonical unit for every associated price and inventory quantity: `unit_price`
+is per **one** such unit; price-break `min_qty`, `on_hand`, `reserved` and
+`inbound` are all expressed in that same unit. There is no separate pricing or
+stock unit and no implicit pack multiplier. The schema and seeded data do not
+contradict this policy; the invariant is not inferred merely from their column
+names. This boundary automatically quotes **only canonical catalog `EA`**.
+Customer spellings `EA`, `each`, `pc`, `pcs`, `piece`, `pieces` (case-insensitive)
+are labels for that unit, not conversions. Boxes, cartons, packs, sets, pairs,
+weights and lengths require clarification; quantities are never multiplied,
+divided, rounded or repaired.
+
+**Required contract.** `to_quote_request` requires keyword arguments
+`source: InboundRfq` (the complete original intake) and
+`extraction: ExtractionResult` (all lines, delivery and open questions), in
+addition to the resolved customer/lines and stated identifiers/instants.
+`ResolvedLine` carries deterministic `catalog_name` and `catalog_uom`, required
+when `RESOLVED`, copied by `resolve_lines` from the catalog without changing the
+embedded extraction. Resolved ordinals and complete embedded claims must match
+the full extraction exactly, in order. The pure `verify_extraction_claims`
+recognizer independently associates source quantity, unit and product; substring
+membership alone cannot establish them. A missing extracted unit is reconcilable
+only when the source explicitly states an approved EA label and the catalog is
+canonical EA. An incorrect quantity or contradictory unit is always refused.
+Quote descriptions come **only from the catalog name**, never the model's
+`description`; actual customer specifications still cause a refusal even when
+the extraction omits them. The optional separate `requested_delivery` argument
+must agree with the full extraction; omission cannot suppress delivery checks.
+`ClaimValidationError(ValueError).issues` exposes deterministic
+`GroundingIssue` code/field/detail/ordinal records for claim/unit refusals;
+existing customer, status, clock and delivery mapping refusals remain
+`ValueError`. No refusal constructs a `QuoteRequest` or calls the quote writer.
+
+**Deliberately narrow supported source syntax.** This is not general email or
+natural-language understanding. Every nonempty body line must be consumed using
+a full-line match, after NFC/whitespace normalization (not compatibility folding of numbers):
+
+* A request is `Please quote <integer> <unit> of <identifier>` or
+  `We need <integer> <unit> of <identifier>`, case-insensitive, optionally ending
+  with ` for our standard replenishment` and/or a final period. One request per
+  line; quantities must fit the extraction's positive-integer bound (1–1,000,000).
+  Identifiers are 1–64 ASCII alphanumeric characters with `.`, `_`, `/`, `-`
+  allowed internally; they start and end alphanumeric. Product identity still
+  requires the existing deterministic catalog resolver; parsing is not resolution.
+* Optional framing is a first-line `Hello,`/`Hej,`, blank lines, and, after a
+  request, `Please send pricing.`/`No specific delivery date is required.`.
+  A terminal `Regards,`/`Best regards,` may have one signature: one or two
+  title-case ASCII company-name words, optional comma, then the purchasing role
+  `Einkauf`, `inköp`, `Procurement` or `Purchasing`. That signature must also
+  match the intake sender name under the existing alias normalization (commas
+  treated as spacing). Arbitrary header/body equality is not signature syntax;
+  all other signatures or trailing text require clarification.
+* A single delivery line is `Deliver to <ASCII-alphabetic-place>` optionally
+  followed by ` on YYYY-MM-DD` or ` by <English-weekday>`, optionally with a final
+  period, case-insensitive. Multiword places/addresses and other forms are not
+  supported here. Only a valid explicit ISO date can become a requested date;
+  weekdays remain unresolved/inferred, never a promised calendar date. The
+  complete extraction's delivery record must equal this independently parsed
+  record (including the raw date phrase). Conflicting/duplicate delivery
+  statements are refused; existing adapter delivery restrictions still apply.
+* The subject is empty, `RFQ`, or `RFQ: [<integer> <unit> ]<identifier>`, with a
+  single matching body request. It cannot introduce quantities, units, product
+  requirements or instructions that the body/extraction ignored.
+
+Unknown prose, specifications (including dimensions/certification/material or
+warranty), corrections, alternatives, pack language, missing/extra/repeated
+requests, cross-line/incidental evidence, conflicting subjects, attachments,
+threaded history, truncated source and unanswered extraction questions refuse
+the **whole quote** for clarification. Even otherwise valid RFQs outside this
+closed grammar are intentionally refused, not guessed. SC-02 continues to stop
+at its ambiguous catalog resolution; its unsupported free-form site/signature
+wording does not get a special verifier exemption. No fixture text was changed.
+
+**Ownership and compatibility.** The pure adapter cannot authenticate a database
+run from an `InboundRfq` (it has no RFQ/run IDs), nor can it authenticate catalog
+facts supplied by arbitrary callers. Trusted composition must supply the actual
+original snapshot and deterministic resolver outputs, never model-populated
+copies. The demo now builds one `InboundRfq` for both RFQ provisioning and
+verification, checks every stored fixture-owned RFQ/run field and run-to-RFQ
+association on reuse, and commits that check before verification. There is no
+fixture, HUMAN-source or `verified=True` bypass. The lower-level deterministic
+quote engine/writer remain internal APIs, not a new external ingress.
+
+No schema or migration change, no rewrite of historical rows, and no changes to
+pricing, inventory, delivery, discount, credit-hold or human-approval rules.
+Existing callers must supply the new required adapter inputs; old `RESOLVED`
+objects lacking catalog fields must be resolved again. The original three demo
+outcomes and identical retries are preserved: SC-01 €46,000 DRAFT for review,
+SC-02 no quote, SC-03 €7,800 credit-held DRAFT. Every successful quote still
+requires human approval; failed verification writes no quote, quote lines,
+blocked ledger, quote-write claim, approval, outbound message or run transition
+(intake RFQ/RECEIVED run provisioning may already have occurred).
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Every variable is prefixed `RFQ_`; nested
