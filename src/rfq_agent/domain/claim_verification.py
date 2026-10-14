@@ -8,13 +8,13 @@ inside otherwise unsupported text is never enough to authorize a quotation.
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date
 from typing import NamedTuple
 
 from rfq_agent.domain.extraction import DateResolution, ExtractionResult, RequestedDelivery
 from rfq_agent.domain.intake import InboundRfq
 from rfq_agent.domain.resolution import GroundingErrorCode, GroundingIssue, normalize_alias
-from rfq_agent.domain.trust import normalize_untrusted
 
 __all__ = ["verify_extraction_claims"]
 
@@ -25,18 +25,18 @@ _ASSOCIATION = r"(?P<qty>[1-9][0-9]{0,6}) (?P<unit>[A-Za-z]+) of (?P<sku>" + _ID
 _REQUEST = re.compile(
     r"(?:please quote|we need) (?P<association>" + _ASSOCIATION + r")"
     r"(?: for our standard replenishment)?\.?",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
 _SUBJECT = re.compile(
     r"RFQ: (?:(?P<qty>[1-9][0-9]{0,6}) (?P<unit>[A-Za-z]+) )?"
     r"(?P<sku>" + _IDENTIFIER + r")",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
 _DELIVERY = re.compile(
     r"Deliver to (?P<destination>[A-Za-z]+)"
     r"(?: (?P<when>on [0-9]{4}-[0-9]{2}-[0-9]{2}|"
     r"by (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)))?\.?",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
 _GREETINGS = frozenset({"hello,", "hej,"})
 _CLOSINGS = frozenset({"best regards,", "regards,"})
@@ -52,6 +52,16 @@ class _Line(NamedTuple):
     unit: str
     sku: str
     association: str
+
+
+def _normalize_statement(text: str) -> str:
+    """Preserve numeric meaning: compatibility folding is not quantity parsing.
+
+    The older substring evidence gate uses NFKC. Here superscripts, full-width
+    digits and compatibility letters must not turn an unsupported expression
+    into a different, supported business request. NFC/spacing alone is allowed.
+    """
+    return " ".join(unicodedata.normalize("NFC", text).split())
 
 
 def _issue(
@@ -92,7 +102,7 @@ def _source_lines(
     signature = False
     no_date = False
     for index, text in enumerate(source.body.text.splitlines(), start=1):
-        raw = normalize_untrusted(text)
+        raw = _normalize_statement(text)
         if not raw:
             continue
         field = f"source.body.line[{index}]"
@@ -174,7 +184,7 @@ def _source_consistency(
 
 def _check_subject(subject: str, lines: list[_Line]) -> tuple[GroundingIssue, ...]:
     """A subject is empty, RFQ, or a corroborating single-product summary."""
-    text = normalize_untrusted(subject)
+    text = _normalize_statement(subject)
     if not text or text.casefold() == "rfq":
         return ()
     match = _SUBJECT.fullmatch(text)
@@ -266,7 +276,7 @@ def verify_extraction_claims(
                     ordinal,
                 )
             )
-        if normalize_untrusted(claim.raw_text) != fact.raw:
+        if _normalize_statement(claim.raw_text) != fact.raw:
             issues.append(
                 _issue(
                     GroundingErrorCode.EVIDENCE_NOT_VERBATIM,
@@ -275,7 +285,7 @@ def verify_extraction_claims(
                     ordinal,
                 )
             )
-        evidence = normalize_untrusted(claim.evidence)
+        evidence = _normalize_statement(claim.evidence)
         # Membership alone is insufficient: the evidence must cover this row's
         # whole independently parsed association (or its complete statement).
         if evidence not in fact.raw or evidence not in (fact.raw, fact.association):

@@ -292,7 +292,7 @@ existing customer, status, clock and delivery mapping refusals remain
 
 **Deliberately narrow supported source syntax.** This is not general email or
 natural-language understanding. Every nonempty body line must be consumed using
-a full-line match, after the project's NFC/whitespace normalization:
+a full-line match, after NFC/whitespace normalization (not compatibility folding of numbers):
 
 * A request is `Please quote <integer> <unit> of <identifier>` or
   `We need <integer> <unit> of <identifier>`, case-insensitive, optionally ending

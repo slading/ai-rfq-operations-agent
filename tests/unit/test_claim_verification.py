@@ -412,6 +412,24 @@ def test_bounded_purchasing_signature_and_intake_name_must_agree(signature, name
         adapt(source(body + "\nATEX required.", sender_name=name), complete())
 
 
+@pytest.mark.parametrize("expression", ["4⁰", "⁴⁰", "\uff14\uff10", "④0", "4\U0001d7d8"])
+def test_compatibility_folding_cannot_manufacture_a_source_integer(expression):
+    # The historical NFKC evidence normalizer would read all these as "40".
+    text = f"Please quote {expression} pcs of 100-ABC"
+    extraction = complete(claim(raw_text=text, evidence=f"{expression} pcs of 100-ABC"))
+    with pytest.raises(ClaimValidationError) as caught:
+        adapt(source(text, subject="RFQ"), extraction)
+    assert GroundingErrorCode.SOURCE_UNSUPPORTED in {issue.code for issue in caught.value.issues}
+
+
+@pytest.mark.parametrize("field", ["raw_text", "evidence"])
+def test_compatibility_spelling_is_not_fabricated_verbatim_evidence(field):
+    value = "Please quote 4⁰ pcs of 100-ABC" if field == "raw_text" else "4⁰ pcs of 100-ABC"
+    with pytest.raises(ClaimValidationError) as caught:
+        adapt(source(), complete(claim(**{field: value})))
+    assert GroundingErrorCode.EVIDENCE_NOT_VERBATIM in {issue.code for issue in caught.value.issues}
+
+
 def test_required_inputs_and_verifier_purity_are_structural_contracts():
     signature = inspect.signature(to_quote_request)
     assert signature.parameters["source"].default is inspect.Parameter.empty
