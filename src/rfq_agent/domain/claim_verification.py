@@ -33,7 +33,7 @@ _SUBJECT = re.compile(
     re.IGNORECASE | re.ASCII,
 )
 _DELIVERY = re.compile(
-    r"Deliver to (?P<destination>[A-Za-z]+)"
+    r"Deliver to (?P<destination>[A-Za-z]{1,200})"
     r"(?: (?P<when>on [0-9]{4}-[0-9]{2}-[0-9]{2}|"
     r"by (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)))?\.?",
     re.IGNORECASE | re.ASCII,

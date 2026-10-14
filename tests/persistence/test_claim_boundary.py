@@ -55,6 +55,12 @@ def changed_scenario(mutation):
         "subject": {"subject": "RFQ: 9 pcs 100-ABC"},
         "specification": {"body": body + "\nATEX certified parts required."},
         "hidden-delivery": {"body": body + "\nDeliver to Hamburg on 2026-10-12."},
+        "overlong-destination": {
+            "body": body.replace(
+                "No specific delivery date is required.",
+                "Deliver to " + "A" * 201 + ".",
+            )
+        },
         "correction": {"body": body + "\nCorrection: only 9 pcs please."},
         "additional-source-line": {"body": body + "\nPlease quote 5 each of PMP-B-150."},
         "missing-source-line": {"body": "Hello,\nPlease send pricing."},
@@ -82,6 +88,7 @@ def changed_scenario(mutation):
         "subject",
         "specification",
         "hidden-delivery",
+        "overlong-destination",
         "correction",
         "additional-source-line",
         "missing-source-line",

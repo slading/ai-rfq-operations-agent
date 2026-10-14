@@ -375,6 +375,26 @@ def test_delivery_claim_must_agree_even_if_separate_delivery_argument_is_omitted
         adapt(source(), extraction, delivery_as_of=datetime(2026, 10, 10, tzinfo=UTC))
 
 
+@pytest.mark.parametrize("length", [201, 1000])
+def test_overlong_source_destination_is_a_structured_refusal(length):
+    snapshot = source(TEXT + "\nDeliver to " + "A" * length + ".")
+    extraction = complete()
+    issues = verify_extraction_claims(snapshot, extraction)
+    assert GroundingErrorCode.SOURCE_UNSUPPORTED in {issue.code for issue in issues}
+    with pytest.raises(ClaimValidationError) as caught:
+        adapt(snapshot, extraction)
+    assert caught.value.issues == issues
+
+
+def test_source_destination_at_the_existing_contract_limit_is_not_truncated():
+    destination = "A" * 200
+    snapshot = source(TEXT + f"\nDeliver to {destination}.")
+    extraction = complete(requested_delivery=RequestedDelivery(destination=destination))
+    assert verify_extraction_claims(snapshot, extraction) == ()
+    request = adapt(snapshot, extraction, delivery_as_of=datetime(2026, 10, 10, tzinfo=UTC))
+    assert request.delivery.destination == destination
+
+
 def test_optional_inferred_date_cannot_be_promoted_into_a_customer_promise():
     snapshot = source(TEXT + "\nDeliver to Hamburg by Friday.")
     extraction = complete(
