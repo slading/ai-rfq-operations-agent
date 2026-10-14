@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 
 from rfq_agent import quote_adapter
-from rfq_agent.domain.extraction import DateResolution, ExtractedLine, RequestedDelivery
+from rfq_agent.domain.extraction import (
+    DateResolution,
+    ExtractedLine,
+    ExtractionResult,
+    RequestedDelivery,
+)
+from rfq_agent.domain.intake import InboundRfq, SourceChannel
 from rfq_agent.domain.resolution import (
     CustomerMatchStatus,
     ResolutionMatchStatus,
@@ -31,6 +37,8 @@ from rfq_agent.domain.resolution import (
     ResolvedCustomer,
     ResolvedLine,
 )
+from rfq_agent.domain.trust import UntrustedText
+from rfq_agent.domain.values import sha256_text
 from rfq_agent.quote_adapter import to_quote_request
 
 MODULE_PATH = Path(quote_adapter.__file__)
@@ -47,13 +55,14 @@ def make_extracted(
     *,
     description: str | None = "Hydraulic pump X-120",
     quantity: int | None = 40,
+    sku: str = "X-120",
 ) -> ExtractedLine:
     payload: dict[str, object] = {
         "ordinal": ordinal,
-        "raw_text": "40 units of X-120",
-        "requested_sku": "X-120",
+        "raw_text": f"Please quote {quantity or 40} pcs of {sku}",
+        "requested_sku": sku,
         "description": description,
-        "evidence": "40 units of X-120",
+        "evidence": f"{quantity or 40} pcs of {sku}",
     }
     if quantity is None:
         payload["missing_reason"] = "NOT_STATED"
@@ -79,6 +88,8 @@ def make_line(
         sku=sku,
         status=status,
         source=source,
+        catalog_name="Hydraulic pump X-120",
+        catalog_uom="EA",
     )
 
 
@@ -104,9 +115,36 @@ def stated(**overrides: object) -> dict[str, object]:
     return inputs
 
 
+def adapt(customer, lines, **kwargs):
+    """Supply consistent source context for the pre-existing mapping/refusal cases.
+
+    Adversarial tests supply independently authored sources directly to the real
+    adapter; this helper is only scaffolding for the older contract cases.
+    """
+    requested = kwargs.get("requested_delivery") or RequestedDelivery()
+    body = "\n".join(line.extracted.raw_text for line in lines) or "Please send pricing."
+    if requested.destination:
+        body += f"\nDeliver to {requested.destination}"
+        if requested.raw:
+            body += f" {requested.raw}"
+        body += "."
+    source = InboundRfq(
+        source_channel=SourceChannel.FIXTURE,
+        received_at=datetime(2026, 10, 10, tzinfo=UTC),
+        body=UntrustedText.from_text(body),
+        sender_email="buyer@example.test",
+        sender_email_hash=sha256_text("buyer@example.test"),
+        idempotency_key="adapter:test:source",
+    )
+    extraction = ExtractionResult(
+        lines=tuple(line.extracted for line in lines), requested_delivery=requested
+    )
+    return to_quote_request(customer, lines, source=source, extraction=extraction, **kwargs)
+
+
 class TestMapping:
     def test_single_line_request_carries_every_stated_fact(self) -> None:
-        request = to_quote_request(make_customer(), [make_line()], **stated())
+        request = adapt(make_customer(), [make_line()], **stated())
 
         assert request.run_id == "RUN-0001"
         assert request.quote_id == "QTE-0001"
@@ -126,12 +164,12 @@ class TestMapping:
             make_line(1, extracted=make_extracted(1)),
             make_line(
                 2,
-                extracted=make_extracted(2, description="Seal kit", quantity=5),
+                extracted=make_extracted(2, description="Seal kit", quantity=5, sku="X-240"),
                 product_id="PRD-0002",
                 sku="X-240",
             ),
         ]
-        request = to_quote_request(make_customer(), lines, **stated())
+        request = adapt(make_customer(), lines, **stated())
 
         assert [line.product_id for line in request.lines] == ["PRD-0001", "PRD-0002"]
         assert [line.quantity for line in request.lines] == [40, 5]
@@ -143,7 +181,7 @@ class TestMapping:
             requested_delivery_date=date(2026, 10, 9),
             destination="Warsaw",
         )
-        request = to_quote_request(
+        request = adapt(
             make_customer(),
             [make_line()],
             requested_delivery=requested,
@@ -163,7 +201,7 @@ class TestMapping:
             resolution=DateResolution.INFERRED,
             destination="Warsaw",
         )
-        request = to_quote_request(
+        request = adapt(
             make_customer(),
             [make_line()],
             requested_delivery=requested,
@@ -176,7 +214,7 @@ class TestMapping:
 
     def test_a_recorded_destination_travels_without_a_date_request(self) -> None:
         requested = RequestedDelivery(destination="Warsaw")
-        request = to_quote_request(
+        request = adapt(
             make_customer(),
             [make_line()],
             requested_delivery=requested,
@@ -189,7 +227,7 @@ class TestMapping:
         assert request.delivery.requested_date is None
 
     def test_no_delivery_claim_leaves_the_question_unasked(self) -> None:
-        request = to_quote_request(
+        request = adapt(
             make_customer(),
             [make_line()],
             requested_delivery=RequestedDelivery(),
@@ -198,7 +236,7 @@ class TestMapping:
         assert request.delivery is None
 
     def test_unstated_fields_stay_unset(self) -> None:
-        request = to_quote_request(make_customer(), [make_line()], **stated())
+        request = adapt(make_customer(), [make_line()], **stated())
 
         (line,) = request.lines
         assert line.notes is None
@@ -206,12 +244,12 @@ class TestMapping:
         assert request.discount is None
 
     def test_human_approval_stays_mandatory(self) -> None:
-        request = to_quote_request(make_customer(), [make_line()], **stated())
+        request = adapt(make_customer(), [make_line()], **stated())
         assert request.require_human_approval is True
 
     def test_the_same_inputs_produce_the_same_request(self) -> None:
-        first = to_quote_request(make_customer(), [make_line()], **stated())
-        second = to_quote_request(make_customer(), [make_line()], **stated())
+        first = adapt(make_customer(), [make_line()], **stated())
+        second = adapt(make_customer(), [make_line()], **stated())
         assert first == second
 
     def test_a_customer_bound_by_a_human_is_quotable(self) -> None:
@@ -220,7 +258,7 @@ class TestMapping:
             match_status=CustomerMatchStatus.NO_MATCH,
             source=ResolutionSource.HUMAN,
         )
-        request = to_quote_request(customer, [make_line()], **stated())
+        request = adapt(customer, [make_line()], **stated())
         assert request.customer_id == "CUST-0002"
 
 
@@ -232,7 +270,7 @@ class TestRefusals:
             source=None,
         )
         with pytest.raises(ValueError, match="customer is unresolved"):
-            to_quote_request(customer, [make_line()], **stated())
+            adapt(customer, [make_line()], **stated())
 
     @pytest.mark.parametrize(
         "match_status",
@@ -247,11 +285,11 @@ class TestRefusals:
     ) -> None:
         customer = make_customer(match_status=match_status, source=ResolutionSource.AGENT)
         with pytest.raises(ValueError, match="requires a human decision"):
-            to_quote_request(customer, [make_line()], **stated())
+            adapt(customer, [make_line()], **stated())
 
     def test_refuses_no_lines(self) -> None:
         with pytest.raises(ValueError, match="at least one line"):
-            to_quote_request(make_customer(), [], **stated())
+            adapt(make_customer(), [], **stated())
 
     @pytest.mark.parametrize(
         ("status", "line_overrides"),
@@ -283,17 +321,17 @@ class TestRefusals:
     ) -> None:
         line = make_line(status=status, **line_overrides)
         with pytest.raises(ValueError, match=r"line 1 is not RESOLVED"):
-            to_quote_request(make_customer(), [line], **stated())
+            adapt(make_customer(), [line], **stated())
 
-    def test_refuses_a_line_without_a_description(self) -> None:
+    def test_catalog_name_replaces_a_missing_model_description(self) -> None:
         line = make_line(extracted=make_extracted(description=None))
-        with pytest.raises(ValueError, match="has no description"):
-            to_quote_request(make_customer(), [line], **stated())
+        request = adapt(make_customer(), [line], **stated())
+        assert request.lines[0].description == line.catalog_name
 
     def test_refuses_a_line_without_a_quantity(self) -> None:
         line = make_line(extracted=make_extracted(quantity=None))
         with pytest.raises(ValueError, match="has no quantity"):
-            to_quote_request(make_customer(), [line], **stated())
+            adapt(make_customer(), [line], **stated())
 
     def test_refuses_a_product_resolved_on_two_lines(self) -> None:
         lines = [
@@ -301,7 +339,7 @@ class TestRefusals:
             make_line(2, extracted=make_extracted(2)),
         ]
         with pytest.raises(ValueError, match="PRD-0001 was resolved on more than one line"):
-            to_quote_request(make_customer(), lines, **stated())
+            adapt(make_customer(), lines, **stated())
 
     @pytest.mark.parametrize(
         "requested_delivery",
@@ -318,7 +356,7 @@ class TestRefusals:
         self, requested_delivery: RequestedDelivery
     ) -> None:
         with pytest.raises(ValueError, match="has no destination"):
-            to_quote_request(
+            adapt(
                 make_customer(),
                 [make_line()],
                 requested_delivery=requested_delivery,
@@ -332,13 +370,13 @@ class TestRefusals:
             make_line(1, extracted=make_extracted(1)),
             make_line(
                 2,
-                extracted=make_extracted(2, description="Seal kit", quantity=5),
+                extracted=make_extracted(2, description="Seal kit", quantity=5, sku="X-240"),
                 product_id="PRD-0002",
                 sku="X-240",
             ),
         ]
         with pytest.raises(ValueError, match="answered about one line"):
-            to_quote_request(
+            adapt(
                 make_customer(),
                 lines,
                 requested_delivery=requested,
@@ -349,7 +387,7 @@ class TestRefusals:
     def test_refuses_a_delivery_question_without_an_instant(self) -> None:
         requested = RequestedDelivery(destination="Warsaw")
         with pytest.raises(ValueError, match="needs the instant it is asked at"):
-            to_quote_request(
+            adapt(
                 make_customer(),
                 [make_line()],
                 requested_delivery=requested,
@@ -359,7 +397,7 @@ class TestRefusals:
     def test_refuses_a_naive_stock_instant(self) -> None:
         naive = datetime(2026, 10, 10, 9, 0, tzinfo=UTC).replace(tzinfo=None)
         with pytest.raises(ValueError, match="stock_as_of must be timezone-aware"):
-            to_quote_request(
+            adapt(
                 make_customer(),
                 [make_line()],
                 **stated(stock_as_of=naive),
@@ -369,7 +407,7 @@ class TestRefusals:
         naive = datetime(2026, 10, 10, 9, 0, tzinfo=UTC).replace(tzinfo=None)
         requested = RequestedDelivery(destination="Warsaw")
         with pytest.raises(ValueError, match="delivery_as_of must be timezone-aware"):
-            to_quote_request(
+            adapt(
                 make_customer(),
                 [make_line()],
                 requested_delivery=requested,

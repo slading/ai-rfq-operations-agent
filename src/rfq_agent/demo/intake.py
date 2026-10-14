@@ -24,7 +24,8 @@ from typing import TYPE_CHECKING
 
 from rfq_agent.demo.errors import DemoError
 from rfq_agent.demo.fixtures import DemoScenario
-from rfq_agent.domain.intake import RfqStatus, SourceChannel
+from rfq_agent.domain.intake import InboundRfq, RfqStatus, SourceChannel
+from rfq_agent.domain.trust import UntrustedText
 from rfq_agent.domain.values import sha256_text
 from rfq_agent.domain.workflow import RunState, RunTrigger
 from rfq_agent.persistence.models import CustomerRow, RfqRow, RunRow
@@ -94,7 +95,7 @@ def require_prerequisites(session: Session) -> None:
         raise DemoError(msg)
 
 
-def provision_run(session: Session, scenario: DemoScenario) -> None:
+def provision_run(session: Session, scenario: DemoScenario) -> InboundRfq:
     """Get-or-create the RFQ and run rows ``scenario`` states.
 
     A stored row is reused only when every fixture-owned field is identical;
@@ -105,17 +106,33 @@ def provision_run(session: Session, scenario: DemoScenario) -> None:
         session: The unit of work both rows are written in. The caller commits.
         scenario: The fixture stating every identifier and instant.
 
+    Returns:
+        The exact immutable source snapshot used to provision/check the RFQ.
+        Callers use it for verification only after this transaction commits.
+
     Raises:
         DemoError: On any differing field in a stored row; the fields are named.
     """
+    source = InboundRfq(
+        source_channel=SourceChannel.FIXTURE,
+        received_at=scenario.received_at,
+        subject=scenario.subject,
+        body=UntrustedText.from_text(scenario.body),
+        sender_name=scenario.sender_name,
+        sender_email=scenario.sender_email,
+        sender_email_hash=sha256_text(scenario.sender_email),
+        idempotency_key=_idempotency_key(scenario),
+    )
     rfq = session.get(RfqRow, scenario.rfq_id)
     if rfq is None:
-        session.add(_rfq_row(scenario))
+        session.add(_rfq_row(scenario, source))
         # Flush between dependency levels: the models declare no relationships,
         # so SQLAlchemy does not order the inserts by foreign key.
         session.flush()
     else:
-        _require_identical(rfq, _rfq_row(scenario), _RFQ_CONTENT_FIELDS, "RFQ", scenario.rfq_id)
+        _require_identical(
+            rfq, _rfq_row(scenario, source), _RFQ_CONTENT_FIELDS, "RFQ", scenario.rfq_id
+        )
 
     run = session.get(RunRow, scenario.run_id)
     if run is None:
@@ -123,6 +140,7 @@ def provision_run(session: Session, scenario: DemoScenario) -> None:
         session.flush()
     else:
         _require_identical(run, _run_row(scenario), _RUN_CONTENT_FIELDS, "run", scenario.run_id)
+    return source
 
 
 def _require_identical(
@@ -153,20 +171,20 @@ def _idempotency_key(scenario: DemoScenario) -> str:
     return f"demo:intake:{scenario.scenario_id}"
 
 
-def _rfq_row(scenario: DemoScenario) -> RfqRow:
+def _rfq_row(scenario: DemoScenario, source: InboundRfq) -> RfqRow:
     """The inbound record, channel ``FIXTURE``: stated, hashed, never parsed."""
     return RfqRow(
         rfq_id=scenario.rfq_id,
-        source_channel=SourceChannel.FIXTURE,
+        source_channel=source.source_channel,
         status=RfqStatus.OPEN,
-        received_at=scenario.received_at,
-        subject=scenario.subject,
-        body_text=scenario.body,
-        body_sha256=sha256_text(scenario.body),
-        sender_name=scenario.sender_name,
-        sender_email=scenario.sender_email,
-        sender_email_hash=sha256_text(scenario.sender_email),
-        idempotency_key=_idempotency_key(scenario),
+        received_at=source.received_at,
+        subject=source.subject,
+        body_text=source.body.text,
+        body_sha256=source.body.sha256,
+        sender_name=source.sender_name,
+        sender_email=source.sender_email,
+        sender_email_hash=source.sender_email_hash,
+        idempotency_key=source.idempotency_key,
         thread_key=None,
         superseded_by_rfq_id=None,
     )

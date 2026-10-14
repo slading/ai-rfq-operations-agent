@@ -17,8 +17,8 @@ boundary:
   and no parallel line schema;
 * **nothing is invented.** Every field of the request is a resolved fact, a
   claim the resolved line carries, or an explicitly stated input (the
-  identifiers and instants only a caller can hold). A missing description,
-  quantity or delivery destination is refused, never filled in; a requested
+  identifiers and instants only a caller can hold). A missing quantity or
+  delivery destination is refused, never filled in; a requested
   delivery date is only ever one the customer stated explicitly (the
   extraction contract keeps ``INFERRED`` dates out of
   ``requested_delivery_date``, so they stay out of the question too);
@@ -48,10 +48,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from rfq_agent.domain.extraction import DateResolution, RequestedDelivery
+from rfq_agent.domain.claim_verification import verify_extraction_claims
+from rfq_agent.domain.extraction import DateResolution, ExtractionResult, RequestedDelivery
 from rfq_agent.domain.ids import CustomerId, ProductId, QuoteId, QuoteNumber, RunId
+from rfq_agent.domain.intake import InboundRfq
 from rfq_agent.domain.resolution import (
     HUMAN_REQUIRED_CUSTOMER_STATUSES,
+    GroundingErrorCode,
+    GroundingIssue,
     ResolutionMatchStatus,
     ResolutionSource,
     ResolvedCustomer,
@@ -62,13 +66,25 @@ from rfq_agent.quoting import DeliveryQuestion, QuoteLineRequest, QuoteRequest
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["to_quote_request"]
+__all__ = ["ClaimValidationError", "to_quote_request"]
+
+
+class ClaimValidationError(ValueError):
+    """Structured pre-quote refusal; never a quote, gate decision or approval."""
+
+    def __init__(self, issues: tuple[GroundingIssue, ...]) -> None:
+        self.issues = issues
+        super().__init__(
+            "; ".join(f"{issue.code}: {issue.field}: {issue.detail}" for issue in issues)
+        )
 
 
 def to_quote_request(
     customer: ResolvedCustomer,
     lines: Sequence[ResolvedLine],
     *,
+    source: InboundRfq,
+    extraction: ExtractionResult,
     run_id: RunId,
     quote_id: QuoteId,
     quote_number: QuoteNumber,
@@ -79,21 +95,26 @@ def to_quote_request(
 ) -> QuoteRequest:
     """Assemble one quote request from resolved facts and stated inputs.
 
-    ``customer`` and ``lines`` are the resolution stage's own outputs;
-    ``requested_delivery`` is the extraction claim about delivery, carried
-    separately because the resolved lines do not hold it. The identifiers and
+    ``source`` is the complete original intake, supplied by trusted composition;
+    ``extraction`` is the complete model claim, including delivery and questions.
+    ``customer`` and ``lines`` are the deterministic resolution stage's outputs.
+    The optional legacy ``requested_delivery`` must equal the full extraction;
+    omitting it cannot omit verification of delivery. The identifiers and
     instants are stated by the caller - this module mints no identifier and
     reads no clock - and ``delivery_as_of`` is required exactly when the
     delivery claims map to a question.
 
     A request is produced only when every fact it needs is already established:
-    the customer is quotable, every line is ``RESOLVED`` with a description and
-    a quantity its claim recorded, no product is asked for twice, and any
+    the customer is quotable, every line is ``RESOLVED`` with a catalog name and
+    canonical EA unit, and its quantity is independently supported by the source.
+    No product is asked for twice, and any
     requested delivery can actually be asked about. Human approval is not an
     option here: the request is built with ``require_human_approval=True``
     because V1 approves nothing without a human.
 
     Raises:
+        ClaimValidationError: When source, extraction or unit verification fails;
+            ``issues`` carries deterministic field/code/detail/ordinal records.
         ValueError: when the resolved facts or stated inputs cannot form a
             quote request without inventing something, silently discarding
             something, or asking the engine a question it refuses.
@@ -108,11 +129,22 @@ def to_quote_request(
         raise ValueError(msg)
     quote_lines = tuple(_to_quote_line(line) for line in lines)
     _require_distinct_products(quote_lines)
+    if requested_delivery is not None and requested_delivery != extraction.requested_delivery:
+        raise ClaimValidationError(
+            (
+                GroundingIssue(
+                    code=GroundingErrorCode.EXTRACTION_INCONSISTENT,
+                    field="requested_delivery",
+                    detail="separately supplied delivery differs from the complete extraction",
+                ),
+            )
+        )
     delivery = _to_delivery_question(
-        requested_delivery,
+        extraction.requested_delivery,
         delivery_as_of=delivery_as_of,
         line_count=len(quote_lines),
     )
+    _verify_claims(source, extraction, lines)
     return QuoteRequest(
         run_id=run_id,
         quote_id=quote_id,
@@ -158,33 +190,65 @@ def _to_quote_line(line: ResolvedLine) -> QuoteLineRequest:
     Only a ``RESOLVED`` line is mapped. A ``DISCONTINUED`` line is refused even
     though resolution matched it: ``QuoteLineRequest`` has no way to carry
     "discontinued", so mapping one would assert an orderable product - a human
-    decides what to offer instead. A claim without a description or a quantity
-    is refused for the same reason: filling either in would invent a business
-    fact. ``notes`` stays ``None``: what a resolved line carries about
+    decides what to offer instead. A missing quantity is refused; the
+    quotation description comes only from the catalog name, never the claim.
+    ``notes`` stays ``None``: what a resolved line carries about
     *resolution* is operator provenance, not a note on a quote line.
     """
     if line.status is not ResolutionMatchStatus.RESOLVED:
         msg = f"line {line.ordinal} is not RESOLVED ({line.status}): refusing to map it"
         raise ValueError(msg)
     extracted = line.extracted
-    if extracted.description is None:
-        msg = (
-            f"line {line.ordinal} has no description: "
-            "a quote line requires one, and the adapter never invents"
-        )
-        raise ValueError(msg)
     if extracted.quantity is None:
         msg = (
             f"line {line.ordinal} has no quantity: "
             "a quote line requires one, and the adapter never invents"
         )
         raise ValueError(msg)
+    if line.catalog_uom != "EA" or line.catalog_name is None:
+        raise ClaimValidationError(
+            (
+                GroundingIssue(
+                    code=GroundingErrorCode.UNIT_UNSUPPORTED,
+                    field=f"lines[ordinal={line.ordinal}].catalog_uom",
+                    detail="catalog name and canonical EA unit required; no conversion permitted",
+                    ordinal=line.ordinal,
+                ),
+            )
+        )
     return QuoteLineRequest(
         product_id=line.product_id,
         sku=line.sku,
-        description=extracted.description,
+        description=line.catalog_name,
         quantity=extracted.quantity,
     )
+
+
+def _verify_claims(
+    source: InboundRfq, extraction: ExtractionResult, lines: Sequence[ResolvedLine]
+) -> None:
+    """Require exact extraction/line correspondence before source verification.
+
+    The trusted caller supplies the source snapshot used for this run. A model
+    must never populate the source or the resolver's catalog fields. This pure
+    seam cannot authenticate database ownership of a caller-supplied snapshot.
+    """
+    if (
+        tuple(line.ordinal for line in lines) != tuple(claim.ordinal for claim in extraction.lines)
+        or tuple(line.extracted for line in lines) != extraction.lines
+    ):
+        raise ClaimValidationError(
+            (
+                GroundingIssue(
+                    code=GroundingErrorCode.EXTRACTION_INCONSISTENT,
+                    field="lines",
+                    detail="resolved lines must exactly match the complete extraction in order",
+                ),
+            )
+        )
+    issues = verify_extraction_claims(source, extraction)
+    if issues:
+        raise ClaimValidationError(issues)
 
 
 def _require_distinct_products(lines: tuple[QuoteLineRequest, ...]) -> None:

@@ -28,6 +28,7 @@ MODULES = [
     "rfq_agent.demo.intake",
     "rfq_agent.demo.runner",
     "rfq_agent.domain",
+    "rfq_agent.domain.claim_verification",
     "rfq_agent.domain.delivery",
     "rfq_agent.domain.extraction",
     "rfq_agent.domain.gating",

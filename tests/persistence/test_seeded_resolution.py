@@ -22,13 +22,21 @@ from datetime import UTC, date, datetime
 import pytest
 from sqlalchemy.orm import Session
 
-from rfq_agent.domain.extraction import DateResolution, ExtractedLine, RequestedDelivery
+from rfq_agent.domain.extraction import (
+    DateResolution,
+    ExtractedLine,
+    ExtractionResult,
+    RequestedDelivery,
+)
+from rfq_agent.domain.intake import InboundRfq, SourceChannel
 from rfq_agent.domain.quote import QuoteStatus
 from rfq_agent.domain.resolution import (
     CustomerMatchStatus,
     ResolutionMatchStatus,
     ResolutionSource,
 )
+from rfq_agent.domain.trust import UntrustedText
+from rfq_agent.domain.values import sha256_text
 from rfq_agent.persistence import Database
 from rfq_agent.persistence.models import QuoteRow
 from rfq_agent.persistence.repositories import BusinessReader
@@ -106,6 +114,21 @@ def requested_delivery() -> RequestedDelivery:
     )
 
 
+def source(*, with_delivery: bool = False) -> InboundRfq:
+    """An independently stated complete RFQ for these chain tests."""
+    text = "Please quote 40 pcs of 100-ABC"
+    if with_delivery:
+        text += "\nDeliver to Hamburg on 2026-10-08."
+    return InboundRfq(
+        source_channel=SourceChannel.FIXTURE,
+        received_at=NOW,
+        body=UntrustedText.from_text(text),
+        sender_email="einkauf@nordwind-industrie.de",
+        sender_email_hash=sha256_text("einkauf@nordwind-industrie.de"),
+        idempotency_key="seeded:test:source",
+    )
+
+
 class TestTheSeededChain:
     def test_email_identity_to_draft_quote_and_no_further(
         self, runs: Session, reader: BusinessReader, writer: QuoteWriter, db: Database
@@ -127,6 +150,10 @@ class TestTheSeededChain:
         request = to_quote_request(
             customer,
             [line],
+            source=source(with_delivery=True),
+            extraction=ExtractionResult(
+                lines=(line.extracted,), requested_delivery=requested_delivery()
+            ),
             requested_delivery=requested_delivery(),
             delivery_as_of=NOW,
             run_id=RUN_ID,
@@ -168,6 +195,8 @@ class TestTheSeededChain:
             to_quote_request(
                 customer,
                 [line],
+                source=source(),
+                extraction=ExtractionResult(lines=(line.extracted,)),
                 run_id=RUN_ID,
                 quote_id="QTE_0001",
                 quote_number="Q-2026-0001",
@@ -190,6 +219,8 @@ class TestTheSeededChain:
             to_quote_request(
                 customer,
                 [line],
+                source=source(),
+                extraction=ExtractionResult(lines=(line.extracted,)),
                 run_id=RUN_ID,
                 quote_id="QTE_0001",
                 quote_number="Q-2026-0001",
