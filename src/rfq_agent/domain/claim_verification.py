@@ -41,8 +41,8 @@ _DELIVERY = re.compile(
 _GREETINGS = frozenset({"hello,", "hej,"})
 _CLOSINGS = frozenset({"best regards,", "regards,"})
 _NO_DATE = "no specific delivery date is required."
-# A supported signature is a company-style name plus an explicit purchasing
-# role, not any string repeated from the untrusted sender header.
+# A signature must match both this company-name/purchasing-role grammar and
+# the intake sender name; header equality alone cannot turn arbitrary prose into framing.
 _SIGNATURE = re.compile(r"[A-Z][a-z]+(?: [A-Z][a-z]+)?,? (?:Einkauf|inköp|Procurement|Purchasing)")
 
 
@@ -108,8 +108,6 @@ def _source_lines(
         field = f"source.body.line[{index}]"
         lower = raw.casefold()
         if closing:
-            # Both signature syntax and the intake sender name must agree.
-            # Header equality alone cannot turn arbitrary prose into framing.
             name = normalize_alias(raw.replace(",", " "))
             sender = normalize_alias((source.sender_name or "").replace(",", " "))
             if not signature and sender and name == sender and _SIGNATURE.fullmatch(raw):

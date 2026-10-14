@@ -1,46 +1,22 @@
-"""The resolved-RFQ to ``QuoteRequest`` seam (Phase 1M-A).
+"""Verify source-backed RFQ claims before constructing a ``QuoteRequest``.
 
-Customer messages become extraction claims, claims become resolved facts, and
-the deterministic quote run in :mod:`rfq_agent.quoting` answers exactly the
-questions a :class:`~rfq_agent.quoting.QuoteRequest` asks. This module is the
-pure seam between the two: it assembles a request from what the resolution
-stage established and what the caller states outright, and it refuses
-everything else. ``quoting.py`` and ``run_quote`` keep their accepted
-contracts untouched - this module only ever *builds* their input.
+Resolution establishes customer/product identity and catalog facts; embedded
+extraction remains a claim until checked against the original intake. The
+adapter requires ``InboundRfq``, the complete ``ExtractionResult`` and the
+resolver's ``ResolvedCustomer``/``ResolvedLine`` outputs. The quote engine's
+contracts remain unchanged.
 
-Where each responsibility lives, so a reviewer can hold this module to its
-boundary:
+Quantities must be independently source-supported and the catalog unit must be
+canonical EA; no quantity repair or unit conversion is permitted. Descriptions
+come only from catalog names. Unsupported or contradictory claims refuse the
+whole request rather than silently dropping lines or delivery requirements.
+Only explicitly stated delivery dates can enter the delivery question; inferred
+dates remain unresolved.
 
-* **no new domain models.** The accepted contracts - ``ResolvedCustomer``,
-  ``ResolvedLine`` and ``RequestedDelivery`` in, ``QuoteRequest`` out - are
-  used exactly as the accepted phases defined them. There is no ``ExtractedRFQ``
-  and no parallel line schema;
-* **nothing is invented.** Every field of the request is a resolved fact, a
-  claim the resolved line carries, or an explicitly stated input (the
-  identifiers and instants only a caller can hold). A missing quantity or
-  delivery destination is refused, never filled in; a requested
-  delivery date is only ever one the customer stated explicitly (the
-  extraction contract keeps ``INFERRED`` dates out of
-  ``requested_delivery_date``, so they stay out of the question too);
-* **refusals are loud.** An unquotable customer, a line that is not
-  ``RESOLVED``, a missing required fact, a naive as-of instant, a requested
-  delivery that cannot be asked about and a product resolved on more than
-  one line all raise ``ValueError`` before any request exists. Nothing is
-  silently dropped: a
-  delivery request that cannot be mapped is a refusal, not a ``delivery=None``;
-* **human approval is mandatory.** Every request built here carries
-  ``require_human_approval=True`` and no parameter can ask for anything else -
-  V1 approves nothing without a human;
-* **pure.** No clock, no persistence, no minted identifier. The same facts and
-  the same stated inputs produce the same request, and every instant the
-  request is asked about arrives as an argument.
-
-The caller is the orchestrator a later phase owns: it holds the identifiers
-(``run_id``, ``quote_id``, ``quote_number``) and the instants (``pricing_as_of``,
-``stock_as_of``, and ``delivery_as_of`` when a delivery question is asked),
-and it is the caller that refuses nothing and learns nothing here - the
-refusals are this module's, precisely so that "the facts were not there" can
-never be discovered inside the quote engine.
+Every request requires human approval. This module neither approves nor
+persists anything, reads no clock and mints no identifiers. The caller supplies
+all identifiers and as-of instants, including ``delivery_as_of`` when a delivery
+question is asked. The same stated inputs produce the same request.
 """
 
 from __future__ import annotations
