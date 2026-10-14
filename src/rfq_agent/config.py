@@ -84,7 +84,10 @@ def _as_bool(value: Any, field: str) -> bool:
         return True
     if text in _FALSE:
         return False
-    msg = f"{field} must be one of true/false/1/0/yes/no/on/off, got {value!r}"
+    # The offending value is deliberately not interpolated: a value pasted into
+    # the wrong variable is exactly the case where quoting it back would print a
+    # credential, and ``hide_input_in_errors`` does not cover message text.
+    msg = f"{field} must be one of true/false/1/0/yes/no/on/off"
     raise ValueError(msg)
 
 
@@ -253,6 +256,11 @@ class Settings(BaseSettings):
         extra="ignore",
         validate_default=True,
         frozen=True,
+        # A model-level validator failure (``_check_production``) makes Pydantic
+        # echo the raw input mapping: the whole settings dump, whose tail - the
+        # last ``RFQ_*`` variable - is where an API key or operator token reached
+        # stderr. Hiding the input removes the echo; diagnostics are unchanged.
+        hide_input_in_errors=True,
     )
 
     env: Environment = Environment.DEVELOPMENT
