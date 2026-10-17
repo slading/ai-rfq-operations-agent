@@ -1,0 +1,77 @@
+== environment ==
+python 3.11.2
+pytest 9.1.1
+pydantic 2.14.1
+sqlalchemy 2.1.5
+prototype sha256: a605d00aa7d0e790bd28d9a18e8ffdec192b29e76df630fa44024b123c1fc98c
+regression sha256: f74d3d359510e243ed3795ae2aa41f6fd0a56000caa826266d4bd2c1cd8c6549
+
+== 1. QA gate (89), unmodified ==
+.................                                                        [100%]
+89 passed in 0.12s
+
+== 2. revision-4 regression suite (219) ==
+...                                                                      [100%]
+219 passed in 0.35s
+
+== 3. extended matrix (101) ==
+EXTENDED MATRIX: 101/101 passed
+
+== 4. falsifiability: same 219 tests against revision 3 ==
+37 failed, 182 passed in 0.56s
+   failures by class:
+     22 TestContainerValuedKeys
+     15 TestEscapedKeyBoundaries
+
+== 5a. full project suite, unmodified tests, revision-4 primitives ==
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[the api key is gsk_abc123supersecret]
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[someone pasted gsk_abc123supersecret into a sentence]
+FAILED tests/unit/test_observability.py::TestRedactText::test_a_header_rule_redacts_to_the_end_of_the_line
+3 failed, 1881 passed, 3 skipped in 109.42s (0:01:49)
+
+== 5b. full project suite with the two approved section-12 test edits ==
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.contracts declares no __all__
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.domain declares no __all__
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.observability declares no __all__
+1887 passed, 3 skipped in 115.91s (0:01:55)
+
+== 6. benchmark (best of five per case, PYTHONPATH=prototype) ==
+== hostile ==
+48KB key-run                                       3.318 ms
+32KB dash-key                                      2.146 ms
+48KB email-dots                                    0.797 ms
+48KB backslash-run                                 3.292 ms
+1MB prose                                         20.303 ms
+1MB 'a='                                          21.193 ms
+110KB password x5000                              47.817 ms
+== PEM ==
+48KB BEGIN markers                                 0.641 ms
+1MB BEGIN markers                                 15.018 ms
+4MB BEGIN markers                                 58.260 ms
+summarize 48KB markers                             0.879 ms
+summarize 1MB markers                             18.162 ms
+== F-1 container paths ==
+5000 small containers (105KB)                     44.199 ms
+5000 unterminated containers (65KB)               11.679 ms
+5000 YAML blocks (105KB)                          55.803 ms
+1 x 70KB container                                 1.385 ms
+nested json string (8KB pad)                       0.721 ms
+
+== summary ==
+QA gate ................ 89/89 passed (unmodified gate from commit 28af34c)
+Regression suite ....... 219/219 passed (0.35 s)
+Extended matrix ........ 101/101 passed
+Falsifiability .......... 37 failed / 182 passed against the revision-3 prototype
+                         (22 TestContainerValuedKeys, 15 TestEscapedKeyBoundaries)
+Full suite unmodified ... 1881 passed, 3 failed, 3 skipped (same 3 IDs as rev 3)
+Full suite with §12 ..... 1887 passed, 3 skipped
+Benchmark .............. all budgets pass idle and under ~1.9x load
+
+Artifacts (outside the repository, no commit):
+  f3a1-design-revision-r4.md          design, §0-§17
+  f3a1-qa-coverage-matrix-r4.md       89 gate rows + 219 regression rows
+  f3a1-prototype-r4.py                reference prototype
+  f3a1-regression-r4.py               219-test regression suite
+  f3a1-extended-matrix.py             101 assertions, unchanged
+  f3a1-test-shim.py                   sitecustomize shim (copy as sitecustomize.py)
+  f3a2-follow-up-contract.md          separate, corrected F3-A2 contract
