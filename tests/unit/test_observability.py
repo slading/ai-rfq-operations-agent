@@ -45,20 +45,32 @@ class TestRedactText:
     @pytest.mark.parametrize(
         "text",
         [
+            "the api key is correcthorsebatterystaple",
+            "someone pasted correcthorsebatterystaple into a sentence",
+        ],
+    )
+    def test_prose_secrets_without_a_known_prefix_are_out_of_scope(self, text: str) -> None:
+        """Documented limitation, not a bug.
+
+        The rules target assignment-style secrets plus a small set of known
+        credential prefixes (``gsk_``, ``sk-``, ``ghp_`` ...). A prose secret
+        with no recognisable prefix is prevented by construction instead: keys
+        and tokens are held in ``SecretStr`` config fields and are never placed
+        into a log record. Redaction is the second line of defence, not the
+        only one.
+        """
+        assert "correcthorsebatterystaple" in redact_text(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
             f"the api key is {SECRET}",
             f"someone pasted {SECRET} into a sentence",
         ],
     )
-    def test_prose_secrets_are_out_of_scope_for_the_pattern_rules(self, text: str) -> None:
-        """Documented limitation, not a bug.
-
-        The rules target assignment-style secrets. A secret embedded in prose is
-        prevented by construction instead: keys and tokens are held in
-        ``SecretStr`` config fields and are never placed into a log record, so
-        there is no prose for them to leak through. Redaction is the second line
-        of defence, not the only one.
-        """
-        assert SECRET in redact_text(text)
+    def test_prose_secrets_with_a_known_prefix_are_caught(self, text: str) -> None:
+        """The provider-prefix backstop is deliberately broader than key=value."""
+        assert SECRET not in redact_text(text)
 
     def test_bearer_token_is_removed(self) -> None:
         assert SECRET not in redact_text(f"used bearer {SECRET} for the call")
@@ -70,12 +82,20 @@ class TestRedactText:
         text = "40 units of X-120 to Warsaw by Friday"
         assert redact_text(text) == text
 
-    def test_a_header_rule_redacts_to_the_end_of_the_line(self) -> None:
-        # Deliberate: a header value runs to the newline, so anything trailing it
-        # on the same line is redacted too. Over-redaction is the safe failure.
+    def test_assignment_values_are_bounded_and_each_is_redacted(self) -> None:
+        # Values are bounded to the token, not to the end of the line: a
+        # trailing business identifier must survive (Session B, B-12). The
+        # security guarantee is unchanged - every secret on the line is
+        # still removed - only the over-redaction is gone.
         redacted = redact_text(f"api_key={SECRET} and also token={SECRET}")
         assert SECRET not in redacted
-        assert redacted == f"api_key={REDACTED}"
+        assert redacted == f"api_key={REDACTED} and also token={REDACTED}"
+
+    def test_a_true_header_still_redacts_to_the_end_of_the_line(self) -> None:
+        # ``Authorization`` is line-scoped by protocol, so the whole value goes.
+        redacted = redact_text(f"Authorization: Basic {SECRET}")
+        assert SECRET not in redacted
+        assert redacted == f"Authorization: {REDACTED}"
 
     def test_secrets_on_separate_lines_are_each_removed(self) -> None:
         redacted = redact_text(f"api_key={SECRET}\ntoken={SECRET}")

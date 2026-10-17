@@ -1,0 +1,9 @@
+{
+  "src/rfq_agent/observability/redaction.py": "29fc0b72dccbe977ff15825221f2f46430370097dd05aea6ad14e842bfe4171a",
+  "tests/unit/test_redaction_adversarial.py": "766c9b7dbae521ded06d167e43db914eb198bd2fa84d7c4f4f3fe5ce8692b44f",
+  "tests/unit/test_redaction_regression.py": "c8d9e8f81420bd254f94611b39c3ea6c73e6e57da03d06f267a84140481090ba",
+  "tests/unit/test_redaction_production.py": "193b900718f4c249299d91592e26a6eff17eb194c4f61852ff5678e6df0c3e6f",
+  "tools/verify_f3a1.py": "f85b8d49d853ac1f74faf425bbfc90b3d91ed6ab37223c9d43533c050fa7ce28",
+  "production_baseline": "d5611eefab3b326e9ad5caa9789d892e69ce3875",
+  "review_source": "66de32c55994144c21df4a9af8b3d1edae1635ad"
+}

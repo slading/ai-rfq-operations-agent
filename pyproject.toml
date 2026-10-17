@@ -95,6 +95,11 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D", "ANN", "PLR2004", "SLF001"]
+# Published security gates are vendored verbatim for checksum reproducibility.
+"tests/unit/test_redaction_adversarial.py" = ["E501", "S311"]
+"tests/unit/test_redaction_regression.py" = [
+    "E501", "F401", "RUF100", "SIM905", "UP031", "PLC0415", "PT018",
+]
 "**/__init__.py" = ["D104"]
 # A command-line entry point exists to write to the terminal: `print` is the
 # interface, not a debugging leftover.
@@ -109,6 +114,8 @@ convention = "google"
 known-first-party = ["rfq_agent"]
 
 [tool.ruff.format]
+# Preserve the exact review artifacts; production code keeps normal formatting.
+exclude = ["tests/unit/test_redaction_adversarial.py", "tests/unit/test_redaction_regression.py"]
 quote-style = "double"
 docstring-code-format = true
 

@@ -1,0 +1,81 @@
+PROVENANCE: 10 pinned review blobs + verbatim gate/regression
+SOURCE: production module /Users/yauhenibuka/f3a1-production/src/rfq_agent/observability/redaction.py; review 66de32c55994144c21df4a9af8b3d1edae1635ad
+REPRO baseline: 'credentials=<{"value": "hunter2024"}>' -> 'credentials=<{"value": "hunter2024"}>'
+REPRO baseline: '{"name": "api_key", "value": "hunter2024"}' -> '{"name": "api_key", "value": "hunter2024"}'
+REPRO baseline: '{"value": "hunter2024", "name": "api_key"}' -> '{"value": "hunter2024", "name": "api_key"}'
+REPRO revision4: 'credentials=<{"value": "hunter2024"}>' -> 'credentials=[REDACTED]: "hunter2024"}>'
+REPRO revision4: '{"name": "api_key", "value": "hunter2024"}' -> '{"name": "api_key", "[REDACTED]": "hunter2024"}'
+REPRO revision4: '{"value": "hunter2024", "name": "api_key"}' -> '{"value": "hunter2024", "name": "api_key"}'
+REPRO production: 'credentials=<{"value": "hunter2024"}>' -> 'credentials=[REDACTED]'
+REPRO production: '{"name": "api_key", "value": "hunter2024"}' -> '{"name": "api_key", "value": "[REDACTED]"}'
+REPRO production: '{"value": "hunter2024", "name": "api_key"}' -> '{"value": "[REDACTED]", "name": "api_key"}'
+EXTENDED MATRIX: 101/101 passed
+FUZZ wrapper: 64 shapes; leaks=0; nonidem=0
+FUZZ record: 640 shapes; leaks=0; nonidem=0
+FUZZ expanded records: 192 shapes; 0 leaks; 0 idempotence failures
+........................................................................ [ 10%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........................................................................ [ 24%]
+........................................................................ [ 30%]
+........................................................................ [ 33%]
+........................................................................ [ 33%]
+........................................................................ [ 33%]
+........................................................................ [ 40%]
+...........                                                              [ 42%]
+659 passed in 0.40s
+........................................................................ [ 14%]
+........................................................................ [ 29%]
+........................................................................ [ 44%]
+........................................................................ [ 58%]
+........................................................................ [ 73%]
+........................................................................ [ 88%]
+..........................................................               [100%]
+490 passed in 2.25s
+REFERENCE DIAGNOSTIC ONLY: published revision-4 shim; expected failures
+........................................................................ [ 25%]
+........................................................................ [ 51%]
+........................................................................ [ 77%]
+...FFFFFFF.F.FFFFFFFFFF.FF.F.FFFFF.FFFFFFF.FFFFF.FF...........           [100%]
+=========================== short test summary info ============================
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=<{"value": "hunter2024"}>]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=({"value": "hunter2024"})]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=({'value': 'hunter2024'},)]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=('value', 'hunter2024')]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=({'a': 1}, {'b': 'hunter2024'})]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=<<{"value": "hunter2024"}>>]
+FAILED ::TestWrapperContainers::test_decorated_containers_are_replaced_whole[credentials=<[{"value": "hunter2024"}]>]
+FAILED ::TestWrapperContainers::test_the_review_example - assert 'credentials...
+FAILED ::TestWrapperContainers::test_inline_yaml_sequence_item - AssertionErr...
+FAILED ::TestWrapperContainers::test_same_indent_yaml_sequence - AssertionErr...
+FAILED ::TestWrapperContainers::test_same_indent_yaml_sequence_keeps_following_line
+FAILED ::TestWrapperContainers::test_malformed_wrappers_withhold_the_tail[credentials=<{"value": "hunter2024"}]
+FAILED ::TestWrapperContainers::test_malformed_wrappers_withhold_the_tail[credentials=({"value": "hunter2024"}]
+FAILED ::TestWrapperContainers::test_malformed_wrappers_withhold_the_tail[credentials=<{"value": "hunter2024"})]
+FAILED ::TestWrapperContainers::test_mismatched_wrapper_with_a_nested_key_is_withheld
+FAILED ::TestWrapperContainers::test_mismatched_wrapper_keeps_the_following_line
+FAILED ::TestWrapperContainers::test_mismatched_wrapper_all_entry_points - As...
+FAILED ::TestWrapperContainers::test_wrapped_scalar_is_consumed_whole - Asser...
+FAILED ::TestWrapperContainers::test_harmless_text_does_not_protect_a_sensitive_value
+FAILED ::TestWrapperContainers::test_harmless_wrapped_scalar_under_a_sensitive_key_is_redacted
+FAILED ::TestWrapperContainers::test_trailing_fields_survive - assert 'creden...
+FAILED ::TestWrapperContainers::test_all_three_entry_points - assert 'hunter2...
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[{"name": "api_key", "value": "hunter2024"}]
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[{'name': 'api_key', 'value': 'hunter2024'}]
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[{"value": "hunter2024", "name": "api_key"}]
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[Credential(name="api_key", value="hunter2024")]
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[value=hunter2024; name=api_key]
+FAILED ::TestCredentialRecords::test_record_secret_is_redacted[{"name": "token", "value": "ghp_abcd1234efgh"}]
+FAILED ::TestCredentialRecords::test_json_record_shape_is_preserved - assert ...
+FAILED ::TestCredentialRecords::test_reversed_record_shape_is_preserved - ass...
+FAILED ::TestCredentialRecords::test_nested_record - AssertionError: {"error"...
+FAILED ::TestCredentialRecords::test_record_with_container_value - AssertionE...
+FAILED ::TestCredentialRecords::test_record_with_array_value - AssertionError...
+FAILED ::TestCredentialRecords::test_record_without_a_value_field_is_untouched
+FAILED ::TestCredentialRecords::test_malformed_record_still_loses_its_secret
+FAILED ::TestCredentialRecords::test_harmless_value_text_is_still_redacted - ...
+FAILED ::TestCredentialRecords::test_encoded_record_fails_closed - AssertionE...
+FAILED ::TestCredentialRecords::test_record_in_text_behind_a_comma_is_not_mistaken_for_a_key
+FAILED ::TestCredentialRecords::test_all_three_entry_points - assert 'hunter2...
+FAILED ::TestCredentialRecords::test_structural_record_mapping - assert 'hunt...
+40 failed, 238 passed in 0.16s
