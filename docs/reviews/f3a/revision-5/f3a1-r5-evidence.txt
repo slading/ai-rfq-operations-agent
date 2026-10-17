@@ -1,0 +1,102 @@
+F3-A1 revision 5 — evidence log
+================================
+
+New build. Every count below was produced by the command shown, against the
+artifacts in docs/reviews/f3a/revision-5/; nothing is copied from an earlier
+report.
+
+Reproduction: put the prototype and the unchanged revision-4 test shim
+(f3a1-test-shim.py, renamed sitecustomize.py) on PYTHONPATH ahead of src/, then
+run the gate, the two regression suites and the extended matrix. All runs use
+synthetic dummy credentials only.
+
+== environment ==
+python 3.11.2
+pytest 9.1.1
+pydantic 2.14.1
+sqlalchemy 2.1.5
+prototype sha256:  99f2229cdee16758a22f33ad6382e8073f39127a1e4ef256e7a40d3a09b8d65b
+regression sha256: c8d9e8f81420bd254f94611b39c3ea6c73e6e57da03d06f267a84140481090ba
+fuzz sha256:       8c39d4fb4e7ef95a34a97ca917cb8799538662539a7c949a4bd8edfec55757b1
+gate sha256:       766c9b7dbae521ded06d167e43db914eb198bd2fa84d7c4f4f3fe5ce8692b44f
+adapted-tests sha256: d9109786c2aa7942a6002b9f3961fb494d1a1986433ba678337fc1d9ca9b2e87
+
+== 1. Session B gate (89), unmodified ==
+89 passed in 0.09s
+
+== 2. revision-3 regression suite, unmodified ==
+162 passed in 0.14s
+
+== 3. revision-4 regression suite (219), unmodified ==
+219 passed in 0.24s
+
+== 4. revision-5 regression suite ==
+278 passed in 0.25s
+
+== 5. extended matrix ==
+EXTENDED MATRIX: 101/101 passed
+
+== 6. falsifiability: revision-5 suite against the revision-4 prototype ==
+40 failed, 238 passed in 0.67s
+   failures by class:
+     18 TestCredentialRecords
+     22 TestWrapperContainers
+
+== 7a. full project suite, unmodified tests ==
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[the api key is gsk_abc123supersecret]
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[someone pasted gsk_abc123supersecret into a sentence]
+FAILED tests/unit/test_observability.py::TestRedactText::test_a_header_rule_redacts_to_the_end_of_the_line
+3 failed, 1881 passed, 3 skipped in 79.64s (0:01:19)
+
+== 7b. full project suite with the two documented §12 adaptations ==
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.domain declares no __all__
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.observability declares no __all__
+1887 passed, 3 skipped in 78.28s (0:01:18)
+
+== 8. fuzz grids ==
+revision 5: wrapper cross-product: 64 shapes, 0 leaks, 0 idempotence violations
+revision 5: credential-record grid: 640 shapes, 0 leaks, 0 idempotence violations
+revision 4: wrapper cross-product: 64 shapes, 24 leaks, 0 idempotence violations
+   'credentials=<{"value": "hunter2024"}}' -> 'credentials=[REDACTED]: "hunter2024"}}'
+   "credentials=<'value': 'hunter2024'}" -> "credentials=[REDACTED]: 'hunter2024'}"
+revision 4: credential-record grid: 640 shapes, 128 leaks, 0 idempotence violations
+   '{"name":"api_key", "value":"hunter2024"}' -> '{"name":"api_key", "[REDACTED]":"hunter2024"}'
+   '{"name" : "api_key", "value" : "hunter2024"}' -> '{"name" : "api_key", "[REDACTED]" : "hunter2024"}'
+
+== 9. idempotence and fail-closed checks ==
+revision 5: idempotence 45 corpus entries, 0 failures total (idempotence + summarize leaks)
+
+== 10. benchmark (min of five runs, three interleaved processes per variant) ==
+case                            rev 4 ms  rev 5 ms    delta
+48KB key-run                        1.51      1.54     2.3%
+32KB dash-key                       1.07      1.09     2.1%
+48KB email-dots                     0.46      0.48     3.7%
+48KB backslash-run                  1.51      1.56     3.2%
+1MB prose                          10.81     11.12     2.9%
+1MB a=                             10.86     11.27     3.8%
+110KB password x5000               32.68     33.22     1.7%
+48KB BEGIN                          0.51      0.51     0.4%
+1MB BEGIN                          10.83     10.85     0.1%
+4MB BEGIN                          43.77     43.74    -0.1%
+summarize 48KB                      0.74      0.73    -0.9%
+summarize 1MB                      14.44     14.54     0.8%
+5000 containers                    34.81     36.47     4.8%
+5000 unterminated                   8.95      8.99     0.5%
+5000 YAML blocks                   42.24     43.72     3.5%
+90KB records                       19.59     30.77    57.1%
+1MB prose name/value               10.30     10.63     3.2%
+deep record                         0.40      0.47    17.3%
+
+budgets: 48KB 1.56 ms < 200; 1MB 11.27 ms < 500; summarize 14.54 ms < 1000
+
+== summary ==
+
+Gate 89/89; revision-3 suite 162/162; revision-4 suite 219/219; revision-5
+suite 278/278; extended 101/101; falsifiability 40 failed / 238 passed against
+the revision-4 prototype (22 wrapper, 18 record); full project suite 1887
+passed / 3 skipped with the two documented §12 adaptations and 1881 / 3 failed
+/ 3 skipped without them (the same three IDs); 64 wrapper shapes and 640 record
+shapes leak-free on revision 5 (revision 4 leaks 24 and 128); idempotence clean
+over 45 corpus entries; budgets pass (worst 1.56 ms at 48 KB, 11.27 ms at 1 MB,
+14.54 ms for summarize_payload at 1 MB). Record-dense text is the only material
+cost (1.57x, 30.77 ms of a 200 ms budget).
