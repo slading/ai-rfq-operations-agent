@@ -1,0 +1,104 @@
+........................................................................ [  3%]
+........................................................................ [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 26%]
+........................................................................ [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 64%]
+............FF...F...................................................... [ 68%]
+...............................s.........s................s............. [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 87%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+........................................................................ [ 99%]
+...............                                                          [100%]
+=================================== FAILURES ===================================
+_ TestRedactText.test_prose_secrets_are_out_of_scope_for_the_pattern_rules[the api key is gsk_abc123supersecret] _
+
+self = <tests.unit.test_observability.TestRedactText object at 0x109358e90>
+text = 'the api key is gsk_abc123supersecret'
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"the api key is {SECRET}",
+            f"someone pasted {SECRET} into a sentence",
+        ],
+    )
+    def test_prose_secrets_are_out_of_scope_for_the_pattern_rules(self, text: str) -> None:
+        """Documented limitation, not a bug.
+
+        The rules target assignment-style secrets. A secret embedded in prose is
+        prevented by construction instead: keys and tokens are held in
+        ``SecretStr`` config fields and are never placed into a log record, so
+        there is no prose for them to leak through. Redaction is the second line
+        of defence, not the only one.
+        """
+>       assert SECRET in redact_text(text)
+E       AssertionError: assert 'gsk_abc123supersecret' in 'the api key is [REDACTED]'
+E        +  where 'the api key is [REDACTED]' = redact_text('the api key is gsk_abc123supersecret')
+
+tests/unit/test_observability.py:61: AssertionError
+_ TestRedactText.test_prose_secrets_are_out_of_scope_for_the_pattern_rules[someone pasted gsk_abc123supersecret into a sentence] _
+
+self = <tests.unit.test_observability.TestRedactText object at 0x109359b90>
+text = 'someone pasted gsk_abc123supersecret into a sentence'
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"the api key is {SECRET}",
+            f"someone pasted {SECRET} into a sentence",
+        ],
+    )
+    def test_prose_secrets_are_out_of_scope_for_the_pattern_rules(self, text: str) -> None:
+        """Documented limitation, not a bug.
+
+        The rules target assignment-style secrets. A secret embedded in prose is
+        prevented by construction instead: keys and tokens are held in
+        ``SecretStr`` config fields and are never placed into a log record, so
+        there is no prose for them to leak through. Redaction is the second line
+        of defence, not the only one.
+        """
+>       assert SECRET in redact_text(text)
+E       AssertionError: assert 'gsk_abc123supersecret' in 'someone pasted [REDACTED] into a sentence'
+E        +  where 'someone pasted [REDACTED] into a sentence' = redact_text('someone pasted gsk_abc123supersecret into a sentence')
+
+tests/unit/test_observability.py:61: AssertionError
+_______ TestRedactText.test_a_header_rule_redacts_to_the_end_of_the_line _______
+
+self = <tests.unit.test_observability.TestRedactText object at 0x10935be10>
+
+    def test_a_header_rule_redacts_to_the_end_of_the_line(self) -> None:
+        # Deliberate: a header value runs to the newline, so anything trailing it
+        # on the same line is redacted too. Over-redaction is the safe failure.
+        redacted = redact_text(f"api_key={SECRET} and also token={SECRET}")
+        assert SECRET not in redacted
+>       assert redacted == f"api_key={REDACTED}"
+E       AssertionError: assert 'api_key=[RED...en=[REDACTED]' == 'api_key=[REDACTED]'
+E
+E         - api_key=[REDACTED]
+E         + api_key=[REDACTED] and also token=[REDACTED]
+
+tests/unit/test_observability.py:78: AssertionError
+=========================== short test summary info ============================
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.contracts declares no __all__
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.domain declares no __all__
+SKIPPED [1] tests/unit/test_package_surface.py:90: rfq_agent.observability declares no __all__
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[the api key is gsk_abc123supersecret]
+FAILED tests/unit/test_observability.py::TestRedactText::test_prose_secrets_are_out_of_scope_for_the_pattern_rules[someone pasted gsk_abc123supersecret into a sentence]
+FAILED tests/unit/test_observability.py::TestRedactText::test_a_header_rule_redacts_to_the_end_of_the_line
+3 failed, 1881 passed, 3 skipped in 43.78s
