@@ -91,6 +91,7 @@ def test_short_and_partially_truncated_secrets_do_not_survive() -> None:
             ],
         )
         rendered = json.dumps(render_validation_error(error)) + summarize_validation_error(error)
+        assert secret not in rendered
         _all_fragments_absent(rendered, secret)
 
 

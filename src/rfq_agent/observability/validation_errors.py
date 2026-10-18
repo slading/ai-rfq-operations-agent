@@ -51,12 +51,11 @@ def render_validation_error(
     untrusted messages. Non-ValidationError objects, malformed counts, and
     unexpected failures produce the same generic unavailable result.
     """
-    if not isinstance(error, ValidationError):
-        return _unavailable_diagnostic()
-
     try:
         # Invoke the native descriptor directly: do not dispatch through an
         # instance attribute that could be overridden by an unusual subclass.
+        # The descriptor also rejects non-ValidationError objects without
+        # reading their potentially hostile __class__ attribute.
         count = ValidationError.error_count(error)
     except Exception:  # noqa: BLE001 - fail closed without exposing exception text
         return _unavailable_diagnostic()
