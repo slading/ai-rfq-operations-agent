@@ -34,6 +34,83 @@ from rfq_agent.observability.ids import TraceContext
 from rfq_agent.observability.spans import ToolResultStatus
 from rfq_agent.observability.validation_errors import render_validation_error
 
+
+@pytest.mark.parametrize(
+    "abort_type", [BaseException, SystemExit, KeyboardInterrupt, GeneratorExit, RuntimeError]
+)
+@pytest.mark.parametrize("stage", ["len", "items", "next", "unpack"])
+@pytest.mark.parametrize(
+    "event", [DiagnosticEvent.OPERATION_FAILED, DiagnosticEvent.VALIDATION_FAILED]
+)
+def test_review_mapping_hooks_contain_all_throwable_failures(abort_type, stage, event):
+    """The totality contract includes hostile hooks raising outside Exception."""
+    canary = "SYNTHETIC_REVIEW_ABORT_SECRET"
+
+    class BadPair:
+        def __iter__(self):
+            raise abort_type(canary)
+
+    class BadMapping(Mapping):
+        def __len__(self):
+            if stage == "len":
+                raise abort_type(canary)
+            return 1
+
+        def __iter__(self):
+            return iter(())
+
+        def __getitem__(self, key):
+            raise AssertionError("items override should avoid item lookup")
+
+        def items(self):
+            if stage == "items":
+                raise abort_type(canary)
+
+            def entries():
+                if stage == "next":
+                    raise abort_type(canary)
+                yield BadPair()
+
+            return entries()
+
+    kwargs = (
+        {"error_code": DiagnosticErrorCode.TIMEOUT}
+        if event is DiagnosticEvent.OPERATION_FAILED
+        else {"validation_error": _settings_validation_error()}
+    )
+    try:
+        out = build_diagnostic_event(event=event, attributes=BadMapping(), **kwargs)
+    except BaseException:  # noqa: BLE001 - turn throwable escapes into ordinary test failures
+        pytest.fail("hostile Mapping failure escaped the boundary")
+    assert out == _EXPECTED_FALLBACK
+    assert canary not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "abort_type", [BaseException, SystemExit, KeyboardInterrupt, GeneratorExit, RuntimeError]
+)
+def test_review_tampered_trace_read_contains_all_throwable_failures(abort_type):
+    """Even an exact-type uninitialized TraceContext degrades to null IDs."""
+
+    class HostileExtra(dict):
+        def __contains__(self, key):
+            raise abort_type("SYNTHETIC_REVIEW_TRACE_SECRET")
+
+    trace = TraceContext.__new__(TraceContext)
+    object.__setattr__(trace, "trace_id", "a" * 32)
+    object.__setattr__(trace, "__pydantic_extra__", HostileExtra(sentinel=1))
+    try:
+        out = build_diagnostic_event(
+            event=DiagnosticEvent.OPERATION_FAILED,
+            error_code=DiagnosticErrorCode.TIMEOUT,
+            trace=trace,
+        )
+    except BaseException:  # noqa: BLE001 - turn throwable escapes into ordinary test failures
+        pytest.fail("hostile TraceContext read failure escaped the boundary")
+    assert out["status"] == "SAFE"
+    assert all(out[key] is None for key in ("trace_id", "rfq_id", "run_id", "span_id"))
+
+
 _API_KEY = "gsk_SYNTHETIC_A1b2C3d4E5f6G7h8"
 _OPERATOR_TOKEN = "op_tok_SYNTHETIC_87654321"  # noqa: S105 - synthetic
 _DATABASE_PASSWORD = "SYNTHETIC_DB_PASS_0123456789"  # noqa: S105 - synthetic

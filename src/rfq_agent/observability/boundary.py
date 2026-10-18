@@ -327,7 +327,7 @@ def _extract_trace(
         run_id = trace.run_id
         span_id = trace.span_id
         parent_span_id = trace.parent_span_id
-    except Exception:  # noqa: BLE001 - fail closed on hostile or uninitialized stand-in
+    except BaseException:  # noqa: BLE001 - trusted-model reads must contain hostile hooks
         return (None, None, None, None)
 
     if parent_span_id is not None and (
@@ -440,7 +440,7 @@ def _process_attributes(
         if type(raw_len) is not int or raw_len < 0 or raw_len > _MAX_ATTRIBUTE_SCAN:
             return (False, {}, 0)
         return _scan_attribute_items(attributes, raw_len, allow_admission=allow_admission)
-    except Exception:  # noqa: BLE001 - hostile Mapping fails closed
+    except BaseException:  # noqa: BLE001 - Mapping hooks may raise outside Exception
         return (False, {}, 0)
 
 
