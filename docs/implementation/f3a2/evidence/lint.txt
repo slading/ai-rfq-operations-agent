@@ -1,0 +1,11 @@
+Ruff lint and formatting evidence
+Date: 2026-10-18
+Environment: Ruff 0.17.1
+
+Commands (repository root):
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+
+Results:
+- ruff check .: All checks passed! (exit status 0)
+- ruff format --check .: 131 files already formatted (exit status 0)

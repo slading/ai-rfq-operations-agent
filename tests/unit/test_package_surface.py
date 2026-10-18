@@ -48,6 +48,7 @@ MODULES = [
     "rfq_agent.observability.ids",
     "rfq_agent.observability.redaction",
     "rfq_agent.observability.spans",
+    "rfq_agent.observability.validation_errors",
     "rfq_agent.persistence",
     "rfq_agent.persistence.base",
     "rfq_agent.persistence.engine",
