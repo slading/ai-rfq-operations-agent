@@ -1,0 +1,15 @@
+F3-A2 / F3-B / F3-A1 security regression evidence
+Date: 2026-10-18
+Environment: Python 3.11.2, Pydantic 2.14.1, pydantic-settings 2.16.0
+
+Command (repository root):
+.venv/bin/python -m pytest -q \
+  tests/unit/test_validation_errors.py \
+  tests/unit/test_config.py \
+  tests/unit/test_redaction_adversarial.py \
+  tests/unit/test_redaction_production.py \
+  tests/unit/test_redaction_regression.py
+
+Result: 491 passed in 5.28s; exit status 0.
+
+The command includes the new aggregate-renderer adversarial cases, existing F3-B configuration disclosure coverage, and F3-A1 adversarial/production/regression coverage. All secrets in these test cases are synthetic. The new renderer does not call ValidationError.errors(), ValidationError.json(), str(error), or repr(error); a hostile-context counter test confirms no rendering-time __str__/__repr__ invocation.

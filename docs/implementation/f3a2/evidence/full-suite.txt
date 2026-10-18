@@ -1,0 +1,15 @@
+Full offline test-suite evidence
+Date: 2026-10-18
+Environment: Python 3.11.2, Pydantic 2.14.1, pydantic-settings 2.16.0
+
+Command (repository root):
+.venv/bin/python -m pytest -q
+
+Result: 2346 passed, 3 skipped in 91.02s; exit status 0.
+
+Existing skips (no new skips):
+- tests/unit/test_package_surface.py: rfq_agent.contracts declares no __all__
+- tests/unit/test_package_surface.py: rfq_agent.domain declares no __all__
+- tests/unit/test_package_surface.py: rfq_agent.observability declares no __all__
+
+No test migrations were made. Pytest used the repository's default offline suite; no live provider tests were enabled.
