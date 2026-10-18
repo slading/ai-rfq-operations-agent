@@ -45,6 +45,7 @@ MODULES = [
     "rfq_agent.domain.values",
     "rfq_agent.domain.workflow",
     "rfq_agent.observability",
+    "rfq_agent.observability.boundary",
     "rfq_agent.observability.ids",
     "rfq_agent.observability.redaction",
     "rfq_agent.observability.spans",
