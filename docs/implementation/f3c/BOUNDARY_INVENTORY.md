@@ -254,3 +254,16 @@ this repo** — the verifier expects an external `--review-root`. Therefore:
 - **No meaning is inferred for them here.** Any mapping of N-x to R-x would be
   fabrication. Approval Question Q6 asks the reviewer to supply the source
   documents or confirm the identifiers are superseded by R27–R32.
+
+## 8. Addendum (PR #10 review, 2026-10-18)
+
+The Phase 1 review identified that the draft contract's regex-based string
+admission would itself have created a new boundary flaw (a secret-shaped
+value such as `hunter2024` is pattern-valid). This does not change any
+inventory finding above — no such field exists in production code — but it
+corrects the *proposed* boundary: see `IMPLEMENTATION_CONTRACT.md` §3.2 for
+the closed-vocabulary policy, the omission of `model`/`tool_name`/hash
+attributes from v1, revised I-1/I-5, and tests A21–A23. Provenance facts used
+there were verified at baseline: `GroqSettings.agent_model` accepts any
+non-empty string, and tool names in `contracts/llm.py` are pattern-validated
+only; no tool/model registry exists yet.

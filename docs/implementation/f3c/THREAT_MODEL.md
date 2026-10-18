@@ -178,3 +178,17 @@ boundary itself.
   by a repo-wide source-scan test plus review. It is **not** implemented in
   F3-C and no sink exists to enforce against today.
 - **No test execution is claimed** for this document set.
+
+## 7. Design correction (PR #10 review, 2026-10-18)
+
+The draft contract's pattern admission (`^[a-z][a-z0-9_.-]{0,63}$` for
+`error_code`/`stage`/`model`/`tool_name`/…) was **syntactic, not semantic**:
+`hunter2024` satisfies it. Threat T-10/T-01 analysis therefore extends to
+*the boundary's own string fields* — a pattern-admitted field is a free-text
+field with a smaller alphabet, not a safe field. The corrected contract
+(§3.2) admits caller-influenced strings **only** from closed, boundary-owned
+vocabularies supplied as enum members, and **omits** dynamic identifiers
+(`model`, `tool_name`, `stage`, hashes) from v1 because no trusted provenance
+(a settings-free model registry, a tool registry) exists at baseline to
+admit them against. Invariants I-1/I-5 were rewritten to claim only what
+this enforces, including the residual vocabulary-choice covert channel.
