@@ -49,16 +49,20 @@ __all__ = [
 
 ```python
 DIAGNOSTIC_SCHEMA = "rfq.diagnostic/v1"
-MAX_DIAGNOSTIC_BYTES = 1024          # hard ceiling on canonical output
+MAX_DIAGNOSTIC_BYTES = 1024  # hard ceiling on canonical output
+
 
 class DiagnosticEvent(StrEnum):
     """Closed event vocabulary — the ONLY events a sink may emit in v1."""
+
     VALIDATION_FAILED = "validation_failed"
-    OPERATION_FAILED  = "operation_failed"     # generic, caller gives only a code
+    OPERATION_FAILED = "operation_failed"  # generic, caller gives only a code
     DIAGNOSTIC_UNAVAILABLE = "diagnostic_unavailable"  # the fail-closed fallback
+
 
 class DiagnosticErrorCode(StrEnum):
     """Closed failure-code vocabulary for OPERATION_FAILED (v1, exhaustive)."""
+
     WORKFLOW_ERROR = "WORKFLOW_ERROR"
     ILLEGAL_TRANSITION = "ILLEGAL_TRANSITION"
     WORKFLOW_TIMEOUT = "WORKFLOW_TIMEOUT"
@@ -76,14 +80,25 @@ class DiagnosticErrorCode(StrEnum):
     PROVIDER_NOT_CONFIGURED = "PROVIDER_NOT_CONFIGURED"
     UNKNOWN = "UNKNOWN"
 
+
 class DiagnosticPurpose(StrEnum):
     """Closed purpose vocabulary (values mirror contracts.llm.ModelPurpose)."""
-    TRIAGE = "triage"; EXTRACT = "extract"; RESOLVE = "resolve"
-    REPAIR = "repair"; CLASSIFY_TRUST = "classify_trust"
+
+    TRIAGE = "triage"
+    EXTRACT = "extract"
+    RESOLVE = "resolve"
+    REPAIR = "repair"
+    CLASSIFY_TRUST = "classify_trust"
+
 
 class DiagnosticResultStatus(StrEnum):
     """Closed result vocabulary (values mirror observability.spans.ToolResultStatus)."""
-    OK = "OK"; ERROR = "ERROR"; DENIED = "DENIED"; TRUNCATED = "TRUNCATED"
+
+    OK = "OK"
+    ERROR = "ERROR"
+    DENIED = "DENIED"
+    TRUNCATED = "TRUNCATED"
+
 
 def build_diagnostic_event(
     *,
@@ -93,6 +108,7 @@ def build_diagnostic_event(
     error_code: DiagnosticErrorCode | None = None,
     attributes: Mapping[str, object] | None = None,
 ) -> dict[str, str | int | bool | None]: ...
+
 
 def summarize_diagnostic_event(event_payload: Mapping[str, object]) -> str: ...
 ```
@@ -267,10 +283,19 @@ attribute overflow beyond recovery, size/depth violation, internal exception
 at any step → return the one constant payload:
 
 ```python
-{"schema": "rfq.diagnostic/v1", "event": "diagnostic_unavailable",
- "status": "UNAVAILABLE", "error_code": None, "trace_id": None,
- "rfq_id": None, "run_id": None, "span_id": None, "validation": None,
- "attributes": {}, "attributes_withheld": 0}
+{
+    "schema": "rfq.diagnostic/v1",
+    "event": "diagnostic_unavailable",
+    "status": "UNAVAILABLE",
+    "error_code": None,
+    "trace_id": None,
+    "rfq_id": None,
+    "run_id": None,
+    "span_id": None,
+    "validation": None,
+    "attributes": {},
+    "attributes_withheld": 0,
+}
 ```
 
 **Fallback/summary non-reflection:** the fallback above is a literal
