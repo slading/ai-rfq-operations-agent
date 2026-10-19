@@ -44,6 +44,8 @@ MODULES = [
     "rfq_agent.domain.trust",
     "rfq_agent.domain.values",
     "rfq_agent.domain.workflow",
+    "rfq_agent.workflow",
+    "rfq_agent.workflow.transitions",
     "rfq_agent.observability",
     "rfq_agent.observability.boundary",
     "rfq_agent.observability.ids",
