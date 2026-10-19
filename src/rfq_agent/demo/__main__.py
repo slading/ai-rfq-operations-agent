@@ -28,8 +28,10 @@ from rfq_agent.demo import (
     run_scenario,
     scenario_by_id,
 )
+from rfq_agent.demo.errors import DemoPrerequisiteError, UnknownScenarioError
 from rfq_agent.domain.policy import PolicyGateDecision, QuoteBlockedLedger
 from rfq_agent.domain.quote import Quote
+from rfq_agent.observability.validation_errors import summarize_validation_error
 from rfq_agent.persistence import Database
 from rfq_agent.persistence.writers import QuoteWriteResult
 from rfq_agent.quoting import QuoteRunResult
@@ -45,9 +47,18 @@ _LABEL = 10
 _INDENT = " " * (_LABEL + 2)
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Argument parser that never echoes attacker-controlled argv values."""
+
+    def error(self, message: str) -> None:  # noqa: ARG002 - argparse interface
+        """Print fixed diagnostics and preserve argparse's usage exit status."""
+        print(f"{self.prog}: error: invalid command-line arguments", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def _parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="python -m rfq_agent.demo",
         description=(
             "Walk fixture scenarios through the accepted RFQ-to-DRAFT chain against the "
@@ -76,7 +87,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0912
     """Run the demonstration.
 
     Args:
@@ -93,43 +104,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"      {scenario.title}")
         return 0
 
+    database = None
+    failure: Exception | None = None
+    outcomes: list[str] = []
     try:
         scenarios = (
             [scenario_by_id(scenario_id) for scenario_id in args.scenario]
             if args.scenario
             else list(SCENARIOS)
         )
-        # The default URL resolves exactly as alembic's does (Settings.load
-        # reads RFQ_* and .env): migration and demo always target one database.
         database = Database.create(args.url or Settings.load().database.url)
-        try:
-            with database.session() as session:
-                require_prerequisites(session)
-            _print_header(database.url.render_as_string(hide_password=True))
-            outcomes: list[str] = []
-            for index, scenario in enumerate(scenarios):
-                if index:
-                    print()
-                report = run_scenario(scenario, database)
-                print(_format_report(report))
-                outcomes.append(f"{scenario.scenario_id}={report.outcome.value}")
-        finally:
-            database.dispose()
-    except DemoError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
-    except ValidationError as error:
-        print(
-            f"error: invalid configuration (RFQ_* environment or .env):\n{error}",
-            file=sys.stderr,
-        )
-        return 2
-    except ValueError as error:
-        print(
-            f"error: the database holds facts the accepted contracts refuse: {error}",
-            file=sys.stderr,
-        )
-        return 2
+        with database.session() as session:
+            require_prerequisites(session)
+        _print_header("configured database")
+        for index, scenario in enumerate(scenarios):
+            if index:
+                print()
+            report = run_scenario(scenario, database)
+            print(_format_report(report))
+            outcomes.append(f"{scenario.scenario_id}={report.outcome.value}")
+    except Exception as error:  # noqa: BLE001 - outer boundary sanitizes all failures
+        failure = error
+    finally:
+        if database is not None:
+            try:
+                database.dispose()
+            except Exception as error:  # noqa: BLE001 - cleanup is untrusted too
+                if failure is None:
+                    failure = error
+
+    if failure is not None:
+        if isinstance(failure, DemoPrerequisiteError):
+            print(
+                "error: demo prerequisites missing; run `alembic upgrade head` "
+                "if the schema is missing, or `make seed` if the dataset is missing",
+                file=sys.stderr,
+            )
+            return 2
+        if isinstance(failure, UnknownScenarioError):
+            print(
+                "error: unknown scenario; use `--list` to see available scenarios", file=sys.stderr
+            )
+            return 2
+        if isinstance(failure, DemoError):
+            print("error: demo could not continue; verify fixture declarations", file=sys.stderr)
+            return 2
+        if isinstance(failure, ValidationError):
+            print(
+                "error: invalid configuration or stored data; "
+                f"{summarize_validation_error(failure)}",
+                file=sys.stderr,
+            )
+            return 2
+        if isinstance(failure, ValueError):
+            print(
+                "error: the database contains facts the accepted contracts refuse", file=sys.stderr
+            )
+            return 2
+        print("error: unexpected demonstration or cleanup failure", file=sys.stderr)
+        return 1
 
     print(f"\nsummary: {', '.join(outcomes)}")
     print(
@@ -150,7 +183,7 @@ def _format_report(report: ScenarioReport) -> str:
     """Render one scenario report as the block the operator reads."""
     scenario = report.scenario
     rows = [f"=== {scenario.scenario_id} · {scenario.title}"]
-    rows.append(_row("sender", f"{scenario.sender_email} (untrusted fixture intake)"))
+    rows.append(_row("sender", "untrusted fixture intake; sender content withheld"))
     rows.append(_row("customer", report.customer_summary))
     for index, summary in enumerate(report.line_summaries, start=1):
         rows.append(_row(f"line {index}", summary))
@@ -162,8 +195,7 @@ def _format_report(report: ScenarioReport) -> str:
         rows.append(
             _row(
                 "quote",
-                f"{quote.quote_number} ({quote.quote_id}) for {quote.customer_id} on run "
-                f"{quote.run_id} - status {quote.status}",
+                f"{quote.quote_number} ({quote.quote_id}) - status {quote.status}",
             )
         )
         rows.extend(_format_money(quote))

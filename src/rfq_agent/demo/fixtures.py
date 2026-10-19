@@ -23,7 +23,7 @@ from typing import Annotated, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
-from rfq_agent.demo.errors import DemoError
+from rfq_agent.demo.errors import UnknownScenarioError
 from rfq_agent.domain.extraction import ExtractedLine, RequestedDelivery
 from rfq_agent.domain.ids import CustomerId, LineItemId, QuoteId, QuoteNumber, RfqId, RunId
 from rfq_agent.domain.values import DomainModel
@@ -150,7 +150,7 @@ def scenario_by_id(scenario_id: str) -> DemoScenario:
             return scenario
     known = ", ".join(scenario.scenario_id for scenario in SCENARIOS)
     msg = f"unknown scenario {scenario_id!r}: the declared scenarios are {known}"
-    raise DemoError(msg)
+    raise UnknownScenarioError(msg)
 
 
 # ---------------------------------------------------------------------------
