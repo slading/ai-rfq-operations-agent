@@ -29,19 +29,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from rfq_agent.demo.errors import DemoError
 from rfq_agent.demo.fixtures import DemoOutcome, DemoScenario
 from rfq_agent.demo.intake import provision_run
 from rfq_agent.domain.extraction import ExtractionResult, RequestedDelivery
 from rfq_agent.domain.resolution import (
     CustomerMatchStatus,
+    ResolutionMatchStatus,
     ResolutionSource,
     ResolvedCustomer,
     ResolvedLine,
 )
 from rfq_agent.persistence.repositories import BusinessReader
 from rfq_agent.persistence.writers import QuoteWriter
-from rfq_agent.quote_adapter import to_quote_request
+from rfq_agent.quote_adapter import ClaimValidationError, to_quote_request
 from rfq_agent.quoting import QuoteRunStatus, run_quote
 from rfq_agent.resolving import bind_customer, resolve_lines
 
@@ -114,11 +117,37 @@ def run_scenario(scenario: DemoScenario, database: Database) -> ScenarioReport:
                 requested_delivery=scenario.requested_delivery,
                 delivery_as_of=scenario.delivery_as_of,
             )
-        except ValueError as error:
-            return _stopped(scenario, customer_summary, line_summaries, str(error))
+        except ClaimValidationError as error:
+            codes = ", ".join(sorted({issue.code.value for issue in error.issues}))
+            return _stopped(
+                scenario,
+                customer_summary,
+                line_summaries,
+                f"Claim verification refused the quote (codes: {codes}).",
+            )
+        except ValidationError:
+            return _stopped(
+                scenario,
+                customer_summary,
+                line_summaries,
+                "A human must review this RFQ before quoting.",
+            )
+        except ValueError:
+            # Adapter ValueErrors can embed untrusted request and database data.
+            return _stopped(
+                scenario,
+                customer_summary,
+                line_summaries,
+                "Quote request refused; human review is required.",
+            )
         result = run_quote(request, reader)
         if result.status is not QuoteRunStatus.COMPLETED:
-            return _stopped(scenario, customer_summary, line_summaries, result.detail)
+            return _stopped(
+                scenario,
+                customer_summary,
+                line_summaries,
+                "A human must review this RFQ before quoting.",
+            )
 
     fresh = _classify(result)
     if fresh is not scenario.expected:
@@ -150,10 +179,7 @@ def _customer_for_quote(
     against the search evidence - or fails at the adapter.
     """
     if customer.match_status is CustomerMatchStatus.EXACT:
-        summary = (
-            f"EXACT identity: {customer.customer_id} - the sender's address is a stored "
-            "e-mail alias of exactly one active customer"
-        )
+        summary = "EXACT identity: the sender's address is a stored alias of one active customer"
         return customer, summary
     binding = scenario.human_binding
     if binding is None:
@@ -187,19 +213,17 @@ def _customer_for_quote(
         match_status=status,
         source=ResolutionSource.HUMAN,
     )
-    summary = (
-        f"{status}: the data alone cannot bind this sender - the operator bound {binding} "
-        "(a fixture-stated human decision, source HUMAN)"
-    )
+    summary = f"{status}: operator supplied a fixture-stated human binding (source HUMAN)"
     return bound, summary
 
 
 def _line_summary(line: ResolvedLine) -> str:
-    """One sentence with the resolution core's ruling for one claimed line."""
-    reason = f" - {line.resolution_reason}" if line.resolution_reason else ""
-    if line.product_id is not None and line.sku is not None:
-        return f"{line.status} {line.sku} ({line.product_id}){reason}"
-    return f"{line.status}{reason}"
+    """One safe sentence with the resolution ruling, excluding identifiers."""
+    if line.status is ResolutionMatchStatus.AMBIGUOUS:
+        return "AMBIGUOUS: multiple catalogue matches; human selection required"
+    if line.status is ResolutionMatchStatus.RESOLVED:
+        return "RESOLVED: catalogue match accepted"
+    return f"{line.status}: human review required"
 
 
 def _classify(result: QuoteRunResult) -> DemoOutcome:

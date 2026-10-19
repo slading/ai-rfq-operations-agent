@@ -22,7 +22,9 @@ Timestamps are the one SQLite-specific subtlety handled elsewhere: see
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,12 +32,12 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine, create_engine, event, make_url
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 from rfq_agent.config import DatabaseSettings, Settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from sqlalchemy.engine import URL
 
@@ -67,6 +69,79 @@ def sqlite_pragmas(
         ("journal_mode", settings.journal_mode),
         ("synchronous", settings.synchronous),
     )
+
+
+class _PoolLogBoundary(logging.LoggerAdapter):
+    """Sanitize this pool's records before any shared handler receives them.
+
+    SQLAlchemy logs and suppresses some reset/close failures. Record ERROR
+    calls before checking the logger level so disabling logs cannot turn a
+    failed cleanup into CLI success. Never forward exception objects, message
+    arguments, traceback metadata, or arbitrary ``extra`` fields.
+    """
+
+    def __init__(self, logger: logging.Logger, record_failure: Callable[[], None]) -> None:
+        super().__init__(logger, {})
+        self._record_failure = record_failure
+
+    def log(
+        self,
+        level: int,
+        msg: object,
+        *args: object,
+        **kwargs: object,  # noqa: ARG002 - raw logging metadata is deliberately discarded
+    ) -> None:
+        """Forward only controlled text, retaining severity and logger policy."""
+        if level >= logging.ERROR:
+            self._record_failure()
+            safe_message = "database pool operation failed; details withheld"
+        elif (
+            type(msg) is str
+            and not args
+            and msg
+            in {
+                "Pool recreating",
+                "Reconnection attempts exhausted on checkout",
+            }
+        ):
+            safe_message = msg
+        else:
+            safe_message = "database pool event; details withheld"
+        self.logger.log(level, safe_message)
+
+
+class _SafePoolMixin:
+    """Contain pool logging without replacing transaction or cleanup methods."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._cleanup_fault_lock = threading.Lock()
+        self._cleanup_fault = False
+        super().__init__(*args, **kwargs)  # type: ignore[misc]
+        self.logger = _PoolLogBoundary(self.logger, self._record_cleanup_fault)
+
+    def _record_cleanup_fault(self) -> None:
+        """Remember a swallowed pool failure without retaining its payload."""
+        with self._cleanup_fault_lock:
+            self._cleanup_fault = True
+
+    def _take_cleanup_fault(self) -> bool:
+        """Consume the pool's failure bit after a disposal operation."""
+        with self._cleanup_fault_lock:
+            failed = self._cleanup_fault
+            self._cleanup_fault = False
+            return failed
+
+
+class _SafeQueuePool(_SafePoolMixin, QueuePool):
+    """Queue pool retaining SQLAlchemy's logger namespace and cleanup policy."""
+
+    _sqla_logger_namespace = "sqlalchemy.pool.impl.QueuePool"
+
+
+class _SafeStaticPool(_SafePoolMixin, StaticPool):
+    """Static pool retaining SQLAlchemy's logger namespace and cleanup policy."""
+
+    _sqla_logger_namespace = "sqlalchemy.pool.impl.StaticPool"
 
 
 #: PRAGMAs applied to every SQLite connection under the default settings.
@@ -167,8 +242,12 @@ def build_engine(
     if is_memory:
         # Every new connection to ":memory:" would otherwise get its own empty
         # database, which is never what the caller means.
-        engine_kwargs["poolclass"] = StaticPool
+        engine_kwargs["poolclass"] = _SafeStaticPool
         connect_args.pop("check_same_thread", None)
+    else:
+        # Contain dependency records per pool, including swallowed reset/close
+        # failures, while retaining SQLAlchemy's connection lifecycle.
+        engine_kwargs["poolclass"] = _SafeQueuePool
 
     engine = create_engine(
         resolved,
@@ -258,8 +337,18 @@ class Database:
         return self.engine.url
 
     def dispose(self) -> None:
-        """Close every pooled connection. Safe to call more than once."""
+        """Close pooled connections and fail safely after reset or close faults.
+
+        SQLAlchemy logs and suppresses some DBAPI reset/close exceptions. The
+        pool boundary sanitizes those records and remembers the failure even
+        when logging is disabled. Check the old pool after engine disposal
+        has closed idle connections and installed a fresh pool.
+        """
+        pool = self.engine.pool
+        take_fault = getattr(pool, "_take_cleanup_fault", None)
         self.engine.dispose()
+        if take_fault is not None and take_fault():
+            raise RuntimeError("database connection cleanup failed") from None
 
     @contextmanager
     def session(self) -> Iterator[Session]:

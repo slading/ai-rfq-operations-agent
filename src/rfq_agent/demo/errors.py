@@ -1,14 +1,17 @@
-"""The demo command's failure contract: actionable messages, never tracebacks."""
+"""Controlled error types for demo CLI failures."""
 
 from __future__ import annotations
 
-__all__ = ["DemoError"]
+__all__ = ["DemoError", "DemoPrerequisiteError", "UnknownScenarioError"]
 
 
 class DemoError(Exception):
-    """A demonstration failure the operator can act on.
+    """Base class for demo failures; messages must not be rendered by the CLI."""
 
-    The command reports it on stderr and exits 2, mirroring the seed command's
-    ``SeedError``. Contract violations raised by the accepted components
-    themselves (``ValueError``) are reported separately as data defects.
-    """
+
+class DemoPrerequisiteError(DemoError):
+    """Safe category for missing schema or demo dataset prerequisites."""
+
+
+class UnknownScenarioError(DemoError):
+    """Safe category for an unrecognized scenario selector."""

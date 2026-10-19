@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from rfq_agent.demo.errors import DemoError
+from rfq_agent.demo.errors import DemoError, DemoPrerequisiteError
 from rfq_agent.demo.fixtures import DemoScenario
 from rfq_agent.domain.intake import InboundRfq, RfqStatus, SourceChannel
 from rfq_agent.domain.trust import UntrustedText
@@ -86,13 +86,15 @@ def require_prerequisites(session: Session) -> None:
     try:
         require_schema(session)
     except SeedSchemaError as error:
-        raise DemoError(str(error)) from error
+        raise DemoPrerequisiteError(
+            "database schema is missing; run `alembic upgrade head`"
+        ) from error
     if session.get(CustomerRow, _DATASET_SENTINEL) is None:
         msg = (
             "the Northwind Components demo dataset is not loaded: write it first with "
             "`make seed` (or `python -m rfq_agent.seed`)"
         )
-        raise DemoError(msg)
+        raise DemoPrerequisiteError(msg)
 
 
 def provision_run(session: Session, scenario: DemoScenario) -> InboundRfq:

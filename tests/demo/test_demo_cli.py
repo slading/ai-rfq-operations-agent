@@ -73,8 +73,9 @@ class TestTheDocumentedWalkthrough:
         result = _run_cli("--url", seeded_url, "--scenario", "SC-01")
 
         assert result.returncode == 0, result.stderr
-        assert "EXACT identity: CUS_0001" in result.stdout
-        assert "RESOLVED PMP-A-100 (PRD_0001) - stored alias match" in result.stdout
+        assert "EXACT identity: the sender's address is a stored alias" in result.stdout
+        assert "einkauf@nordwind-industrie.de" not in result.stdout
+        assert "RESOLVED: catalogue match accepted" in result.stdout
         assert "status DRAFT" in result.stdout
         assert "subtotal 46000.00 EUR - discount 0.00" in result.stdout
         assert "(no discount applies) = total 46000.00 EUR" in result.stdout
@@ -99,8 +100,9 @@ class TestTheDocumentedWalkthrough:
         result = _run_cli("--url", seeded_url, "--scenario", "SC-02")
 
         assert result.returncode == 0, result.stderr
-        assert "AMBIGUOUS - catalogue number matches PRD_0001, PRD_0002" in result.stdout
-        assert "line 1 is not RESOLVED (AMBIGUOUS): refusing to map it" in result.stdout
+        assert "AMBIGUOUS: multiple catalogue matches; human selection required" in result.stdout
+        assert "PRD_0001" not in result.stdout
+        assert "PRD_0002" not in result.stdout
         assert "outcome   : HUMAN_REQUIRED_BEFORE_QUOTE" in result.stdout
         assert _count(session, "quotes") == 0
         assert _count(session, "quote_blocked_reasons") == 0
@@ -111,8 +113,9 @@ class TestTheDocumentedWalkthrough:
         result = _run_cli("--url", seeded_url, "--scenario", "SC-03")
 
         assert result.returncode == 0, result.stderr
-        assert "the operator bound CUS_0007" in result.stdout
-        assert "RESOLVED PMP-B-150 (PRD_0003) - exact SKU match" in result.stdout
+        assert "operator supplied a fixture-stated human binding" in result.stdout
+        assert "RESOLVED: catalogue match accepted" in result.stdout
+        assert "CUS_0007" not in result.stdout
         assert "= total 7800.00 EUR" in result.stdout
         assert "eligible for human review: NO" in result.stdout
         assert "CREDIT_HOLD - customer account is on credit hold" in result.stdout
@@ -186,7 +189,8 @@ class TestDatabaseResolution:
         result = _run_cli("--scenario", "SC-01", env={"RFQ_DATABASE__URL": seeded_url})
 
         assert result.returncode == 0, result.stderr
-        assert f"database: {seeded_url}" in result.stdout
+        assert "database: configured database" in result.stdout
+        assert seeded_url not in result.stdout
         assert "outcome   : DRAFT_AWAITING_HUMAN_REVIEW" in result.stdout
         assert _count(session, "quotes") == 1
 
@@ -210,8 +214,10 @@ class TestOperatorFailures:
         result = _run_cli("--url", seeded_url, "--scenario", "SC-99")
 
         assert result.returncode == 2
-        assert "unknown scenario 'SC-99'" in result.stderr
-        assert "SC-01, SC-02, SC-03" in result.stderr
+        assert "unknown scenario" in result.stderr
+        assert "use `--list`" in result.stderr
+        assert "SC-99" not in result.stderr
+        assert "SC-01" not in result.stderr
         assert result.stdout == ""
 
     def test_list_scenarios_needs_no_database(self) -> None:

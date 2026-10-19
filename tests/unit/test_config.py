@@ -324,7 +324,7 @@ class TestValidationErrorDisclosure:
         )
 
         assert completed.returncode == 2
-        assert "RFQ_REDACT_LOGS must be one of true/false/1/0/yes/no/on/off" in completed.stderr
+        assert "invalid configuration or stored data" in completed.stderr
         assert _leaked_fragments(completed.stderr, _API_KEY) == []
 
     def test_every_secret_stays_out_when_several_are_configured(
@@ -387,7 +387,7 @@ class TestValidationErrorDisclosure:
         )
 
         assert completed.returncode == 2
-        assert "redact_logs must be true when env=production" in completed.stderr
+        assert "invalid configuration or stored data" in completed.stderr
         assert "input_value" not in completed.stderr
         for secret in (_API_KEY, _OPERATOR_TOKEN):
             assert _leaked_fragments(completed.stderr, secret) == []

@@ -22,14 +22,29 @@ from collections.abc import Sequence
 
 from rfq_agent.persistence import Database
 from rfq_agent.seed.dataset import DATASET_NAME, SEED_VERSION, total_rows
-from rfq_agent.seed.loader import SeedError, reset_and_seed, seed
+from rfq_agent.seed.loader import (
+    SeedError,
+    SeedResetBlockedError,
+    SeedSchemaError,
+    reset_and_seed,
+    seed,
+)
 
 __all__ = ["main"]
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Argument parser that never echoes attacker-controlled argv values."""
+
+    def error(self, message: str) -> None:  # noqa: ARG002 - argparse interface
+        """Print fixed diagnostics and preserve argparse's usage exit status."""
+        print(f"{self.prog}: error: invalid command-line arguments", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def _parser() -> argparse.ArgumentParser:
     """Build the argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="python -m rfq_agent.seed",
         description=(
             f"Write the {DATASET_NAME} demo dataset ({SEED_VERSION}, "
@@ -59,17 +74,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit code: ``0`` on success, ``2`` on a seed failure.
     """
     args = _parser().parse_args(argv)
-    database = Database.create(args.url)
+    database = None
+    failure: Exception | None = None
+    rendered_report: str | None = None
     try:
+        database = Database.create(args.url)
         with database.session() as session:
             report = reset_and_seed(session) if args.reset else seed(session)
-    except SeedError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 2
+        rendered_report = report.format()
+    except Exception as error:  # noqa: BLE001 - outer boundary sanitizes every failure
+        failure = error
     finally:
-        database.dispose()
+        if database is not None:
+            try:
+                database.dispose()
+            except Exception as error:  # noqa: BLE001 - cleanup is also untrusted
+                if failure is None:
+                    failure = error
 
-    print(report.format())
+    if failure is not None:
+        if isinstance(failure, SeedSchemaError):
+            print("error: database schema is missing; run `alembic upgrade head`", file=sys.stderr)
+            return 2
+        if isinstance(failure, SeedResetBlockedError):
+            print(
+                "error: reset is blocked by existing business data; use a fresh demo database",
+                file=sys.stderr,
+            )
+            return 2
+        if isinstance(failure, SeedError):
+            print("error: seed operation could not be completed", file=sys.stderr)
+            return 2
+        print("error: unexpected seed or cleanup failure", file=sys.stderr)
+        return 1
+
+    if rendered_report is None:
+        print("error: seed operation produced no report", file=sys.stderr)
+        return 1
+    print(rendered_report)
     return 0
 
 
