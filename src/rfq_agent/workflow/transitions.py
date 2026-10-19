@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Final
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from rfq_agent.domain.workflow import (
@@ -33,7 +34,6 @@ __all__ = [
     "InvariantViolationError",
     "RunNotFoundError",
     "UnsupportedTransitionError",
-    "_transition_run",
 ]
 
 _MAX_RUN_ID_LEN: Final[int] = 64
@@ -258,9 +258,7 @@ def _transition_run(  # noqa: PLR0912
 
     try:
         session.flush()
-    except Exception as exc:
-        raise AuditConstraintError(
-            run_id, f"audit constraint failed: {type(exc).__name__}"
-        ) from exc
+    except IntegrityError:
+        raise AuditConstraintError(run_id) from None
 
     return run, event_row
