@@ -121,16 +121,23 @@ After Case D: every count above is unchanged.
 
 ## Concurrency and lifecycle guarantees
 
-Four properties are enforced and regression-tested; each was a review finding on
-the first version of this slice.
+Five properties are enforced and regression-tested; each was a review finding on
+the first version of this slice, or on the fix for its findings.
 
 * **The write re-checks the history it joins, atomically.** The quote is written
   in a transaction that first takes SQLite's write lock (`BEGIN IMMEDIATE`) and
-  then re-asserts the stored intake and the run's complete lifecycle projection.
-  A run another worker advanced or terminated between intake and this write is a
-  `CONFLICT` with **nothing** stored — no quote, no line, and no idempotency
-  claim left behind. Checking and writing in one transaction is what removes the
-  window a second writer could slip through.
+  then re-asserts the stored intake — its content, the run's complete lifecycle
+  projection, and the source's completeness. A run another worker advanced or
+  terminated between intake and this write is a `CONFLICT` with **nothing**
+  stored — no quote, no line, and no idempotency claim left behind. Checking and
+  writing in one transaction is what removes the window a second writer could
+  slip through.
+* **The source must still be reconstructable in full.** `load_source` refuses an
+  RFQ carrying attachment metadata, because it can reconstruct the body and the
+  sender but not the files. The same rule is re-asserted under the write lock, so
+  a second connection that commits an attachment between loading the source and
+  writing the quote produces a typed `CONFLICT`, not a quote verified against a
+  source the rest of the system now rejects.
 * **A replay rejoins only an untouched run.** "Untouched" is every lifecycle
   column — trigger, attempt number, prior run, outcome, failure code, retry
   count, checkpoint stage, row version and both timestamps — not just `state`

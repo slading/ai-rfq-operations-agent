@@ -43,7 +43,10 @@ keeps it; the lock is then its own to hold.
 The same complete check is exported as :func:`require_intake_preconditions`, so a
 caller can re-assert it inside a later write transaction (the quote write path
 does exactly that) and close the gap between "intake looked untouched" and "the
-rows were written".
+rows were written". That check covers the source as a whole, not just the RFQ
+columns: a stored RFQ that has since acquired attachment metadata is refused,
+because :func:`load_source` cannot reconstruct it and verifying only the body
+would silently drop source content.
 
 What this module deliberately does not write: attachments, thread links,
 supersession, refusal events or run transitions. ``intake_events`` records
@@ -168,6 +171,8 @@ class IntakeConflictKind(StrEnum):
     LIFECYCLE_MOVED = "LIFECYCLE_MOVED"
     #: The stored RFQ a caller expected to read back is no longer there.
     INTAKE_MISSING = "INTAKE_MISSING"
+    #: The stored RFQ has acquired attachment metadata this path cannot verify.
+    ATTACHMENTS_PRESENT = "ATTACHMENTS_PRESENT"
 
 
 class IntakeConflictError(IntakeError):
@@ -427,12 +432,15 @@ def require_intake_preconditions(
 
     This is the complete check a replay and any later write against the same
     intake must pass. It compares every field the declaration owns - the RFQ's
-    content, digests and status, and the run's whole lifecycle projection - and
-    names the fields that disagree.
+    content, digests and status - then asserts the source is still one this path
+    can reconstruct in full (no attachment metadata), and finally compares the
+    run's whole lifecycle projection, naming the fields that disagree.
 
     It is safe to call inside another writer's transaction: the reads then see
     that transaction's snapshot, which is what makes the quote write path's
-    guard atomic rather than a check-then-write race.
+    guard atomic rather than a check-then-write race. Called there under
+    ``BEGIN IMMEDIATE`` it is also the last word on the source: no attachment
+    can be committed between this read and the write that follows it.
 
     Args:
         session: The unit of work to read through. Nothing is written here.
@@ -443,8 +451,9 @@ def require_intake_preconditions(
 
     Raises:
         IntakeConflictError: When the RFQ is missing or differs from the
-            declaration (``CONTENT_DIFFERS``/``INTAKE_MISSING``), or the run is
-            no longer the untouched initial attempt (``LIFECYCLE_MOVED``).
+            declaration (``CONTENT_DIFFERS``/``INTAKE_MISSING``), when it has
+            acquired attachment metadata (``ATTACHMENTS_PRESENT``), or when the
+            run is no longer the untouched initial attempt (``LIFECYCLE_MOVED``).
     """
     row = stored if stored is not None else session.get(RfqRow, declaration.rfq_id)
     if row is None:
@@ -456,6 +465,7 @@ def require_intake_preconditions(
     _require_identical(
         row, expected if expected is not None else _rfq_row(declaration, declaration.to_source())
     )
+    _require_no_attachments(session, declaration.rfq_id)
     _require_untouched_run(session, declaration)
 
 
@@ -471,6 +481,31 @@ def _require_identical(stored: RfqRow, expected: RfqRow) -> None:
             "row is neither overwritten nor rejoined - declare a new identity"
         )
         raise IntakeConflictError(IntakeConflictKind.CONTENT_DIFFERS, msg)
+
+
+def _require_no_attachments(session: Session, rfq_id: str) -> None:
+    """Refuse a stored RFQ that has acquired attachment metadata.
+
+    :func:`load_source` is the only source a quotation may be verified against,
+    and it refuses an RFQ with attachments because it can reconstruct the body
+    and the sender but not the files. This is the same rule, stated where a
+    writer can re-assert it: an attachment added by another connection after the
+    source was loaded would otherwise leave a quote verified against a source
+    that is no longer the full one.
+
+    The query is a presence test, not a read of the metadata: no filename,
+    content type or preview is loaded, and the message names no attachment.
+    """
+    present = session.scalar(
+        select(RfqAttachmentRow.attachment_id).where(RfqAttachmentRow.rfq_id == rfq_id).limit(1)
+    )
+    if present is not None:
+        msg = (
+            "the stored RFQ carries attachment metadata this path cannot reconstruct: "
+            "verifying only the body would silently drop source content, so nothing is "
+            "written against it"
+        )
+        raise IntakeConflictError(IntakeConflictKind.ATTACHMENTS_PRESENT, msg)
 
 
 def _require_untouched_run(session: Session, declaration: IntakeDeclaration) -> None:

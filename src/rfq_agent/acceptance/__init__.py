@@ -27,10 +27,11 @@ What it adds is the order, the boundaries and the outcome vocabulary:
   the run in between. The quote write therefore owns one transaction that takes
   SQLite's write lock, re-asserts
   :func:`rfq_agent.intake.require_intake_preconditions`, and only then writes the
-  claim and the rows: a run that advanced, finished or was re-parented - or a
-  source that changed - is a ``CONFLICT`` with nothing stored, never a quote
-  attached to an impossible history. Checking and writing in the same
-  transaction is what removes the window a second writer could slip through.
+  claim and the rows: a run that advanced, finished or was re-parented, a
+  source that changed, or one that acquired attachment metadata after it was
+  loaded is a ``CONFLICT`` with nothing stored, never a quote attached to an
+  impossible history. Checking and writing in the same transaction is what
+  removes the window a second writer could slip through.
 * **contention is bounded and typed.** Two first deliveries of the same message
   serialise in intake (``BEGIN IMMEDIATE``); a lock that outlives that is
   retried a fixed number of times and then surfaced as

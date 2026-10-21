@@ -11,6 +11,10 @@ Three guarantees, each reproduced and then pinned:
 * **P2b** - concurrent first deliveries serialise instead of racing a deferred
   read into a constraint failure, and a lock that outlives the bounded budget
   is a typed error rather than a raw ``OperationalError``.
+* **P2c** - the guarded write re-checks the *whole* source. A second connection
+  that commits attachment metadata after the source was loaded and before the
+  quote is written is a ``CONFLICT`` too: the quote would otherwise be verified
+  against a source ``load_source`` no longer accepts.
 """
 
 from __future__ import annotations
@@ -43,13 +47,21 @@ from rfq_agent.domain.workflow import (
     RunTrigger,
     TransitionEvent,
 )
-from rfq_agent.intake import provision_intake
+from rfq_agent.intake import (
+    IntakeConflictError,
+    IntakeConflictKind,
+    IntakeIntegrityError,
+    load_source,
+    provision_intake,
+    require_intake_preconditions,
+)
 from rfq_agent.persistence import Database
 from rfq_agent.persistence.models import (
     IdempotencyClaimRow,
     IntakeEventRow,
     QuoteLineRow,
     QuoteRow,
+    RfqAttachmentRow,
     RfqRow,
     RunRow,
 )
@@ -551,3 +563,146 @@ def test_the_retry_budget_is_bounded() -> None:
         acceptance._with_busy_retry(always_busy, on_exhausted=AcceptanceContentionError("busy"))
 
     assert attempts["count"] == acceptance._WRITE_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# P2c - the source gains attachments between loading it and writing the quote
+# ---------------------------------------------------------------------------
+
+
+def _attach(database: Database, rfq_id: str, *, attachment_id: str = "ATT_TEST_9999") -> None:
+    """Another connection's committed statement: metadata for ``rfq_id``."""
+    with database.session_factory() as other:
+        other.add(
+            RfqAttachmentRow(
+                attachment_id=attachment_id,
+                rfq_id=rfq_id,
+                filename="specification.pdf",
+                content_type="application/pdf",
+                byte_length=12,
+            )
+        )
+        other.commit()
+
+
+def test_an_attachment_added_between_calculation_and_the_write_is_refused(
+    seeded, session, monkeypatch
+) -> None:
+    """The finding's reproduction: load the source, calculate, attach, write.
+
+    ``run_quote`` is the last step before the write and runs with the source
+    already loaded, so attaching here is exactly the race the reviewer
+    described - and it is deterministic, not timing-dependent.
+    """
+    declaration = make_declaration()
+    attached: dict[str, object] = {}
+    original = acceptance.run_quote
+
+    def run_quote_then_attach(request, reader):
+        result = original(request, reader)
+        # The source has been loaded and verified; nothing is written yet.
+        _attach(seeded, declaration.intake.rfq_id)
+        attached["calculation"] = result.calculation
+        return result
+
+    monkeypatch.setattr(acceptance, "run_quote", run_quote_then_attach)
+
+    report = accept_rfq(declaration, seeded)
+
+    # The window really was the one under test: the calculation existed first.
+    assert attached["calculation"] is not None
+    assert report.outcome is AcceptanceOutcome.CONFLICT
+    assert report.reason is AcceptanceReason.STORED_STATE_CONFLICT
+    assert report.quote_id is None
+    assert report.total is None
+
+    session.expire_all()
+    assert _quotes(session) == []
+    assert _count(session, QuoteLineRow) == 0
+    assert _count(session, IdempotencyClaimRow) == 0
+    # The other worker's row is history, not something this path may undo.
+    assert _count(session, RfqAttachmentRow) == 1
+    # And the source the quote would have been verified against is now refused.
+    with pytest.raises(IntakeIntegrityError):
+        load_source(session, "RFQ_TEST_0001")
+
+
+def test_a_late_attachment_does_not_disturb_an_existing_quote_on_replay(seeded, session) -> None:
+    """A replay after the attachment is refused, without rewriting what exists."""
+    first = accept_rfq(make_declaration(), seeded)
+    assert first.outcome is AcceptanceOutcome.DRAFT_AWAITING_HUMAN_REVIEW
+
+    _attach(seeded, "RFQ_TEST_0001")
+    replay = accept_rfq(make_declaration(), seeded)
+
+    assert replay.outcome is AcceptanceOutcome.CONFLICT
+    assert replay.reason is AcceptanceReason.STORED_STATE_CONFLICT
+    assert replay.quote_id is None
+
+    session.expire_all()
+    # Exactly the first delivery's artefacts: the refusal added nothing.
+    assert _quotes(session) == ["QTE_TEST_0001"]
+    assert _count(session, QuoteLineRow) == 1
+    assert _count(session, IdempotencyClaimRow) == 1
+    assert _count(session, RfqAttachmentRow) == 1
+
+
+def test_the_attachment_check_runs_inside_the_write_lock(
+    seeded, database_path, monkeypatch
+) -> None:
+    """The absence check is under ``BEGIN IMMEDIATE``, not alongside it.
+
+    While the precondition runs, a second connection must not be able to take
+    the write lock. That is the property that makes the check the *last* word on
+    the source: an attachment committed afterwards would need the lock the
+    conditioned write already holds.
+    """
+    observed: dict[str, object] = {}
+    original = acceptance.require_intake_preconditions
+
+    def check_under_the_lock(work_session, declaration):
+        original(work_session, declaration)
+        probe = sqlite3.connect(str(database_path), timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                probe.execute("BEGIN IMMEDIATE")
+            observed["blocked"] = True
+        finally:
+            probe.close()
+
+    monkeypatch.setattr(acceptance, "require_intake_preconditions", check_under_the_lock)
+
+    report = accept_rfq(make_declaration(), seeded)
+
+    assert observed["blocked"] is True
+    assert report.outcome is AcceptanceOutcome.DRAFT_AWAITING_HUMAN_REVIEW
+
+
+def test_the_attachment_check_is_scoped_to_the_declared_rfq(seeded) -> None:
+    """An attachment somewhere else is not this declaration's history."""
+    first, second = make_declaration(number=1), make_declaration(number=2)
+    with seeded.session() as work:
+        provision_intake(work, first.intake)
+        provision_intake(work, second.intake)
+    _attach(seeded, second.intake.rfq_id)
+
+    with seeded.session() as work:
+        # The untouched declaration still passes in full...
+        require_intake_preconditions(work, first.intake)
+        # ...and only the one carrying metadata is refused, by kind.
+        with pytest.raises(IntakeConflictError) as raised:
+            require_intake_preconditions(work, second.intake)
+    assert raised.value.kind is IntakeConflictKind.ATTACHMENTS_PRESENT
+
+
+def test_an_untouched_source_without_attachments_still_replays(seeded, session) -> None:
+    """The control: the check refuses metadata, not the ordinary second call."""
+    first = accept_rfq(make_declaration(), seeded)
+    again = accept_rfq(make_declaration(), seeded)
+
+    assert first.outcome is AcceptanceOutcome.DRAFT_AWAITING_HUMAN_REVIEW
+    assert again.outcome is AcceptanceOutcome.DUPLICATE
+    session.expire_all()
+    assert _quotes(session) == ["QTE_TEST_0001"]
+    assert _count(session, IdempotencyClaimRow) == 1
+    assert _count(session, RfqAttachmentRow) == 0

@@ -305,10 +305,11 @@ declaration, prerequisite or run failure. The command prints no body text, no
 subject and no sender address, and reduces every exception to fixed text.
 
 The quote is written under a guard that shares its transaction: the write takes
-SQLite's write lock first and then re-asserts the stored intake and the run's
-**complete** lifecycle projection, so a run another worker advanced or
-terminated between intake and the write is a `CONFLICT` with nothing stored — no
-quote, no line and no claim. Intake likewise takes the write lock before its
+SQLite's write lock first and then re-asserts the stored intake, the source's
+completeness (an RFQ that acquired attachment metadata is refused, exactly as
+`load_source` refuses it) and the run's **complete** lifecycle projection, so a
+run another worker advanced or terminated between intake and the write is a
+`CONFLICT` with nothing stored — no quote, no line and no claim. Intake likewise takes the write lock before its
 existence reads, so two first deliveries of one message serialise into one set of
 rows and an idempotent `DUPLICATE` rather than a constraint race; contention that
 outlives a fixed, small retry budget is reported as such instead of being
