@@ -28,7 +28,22 @@ declaration names its own ``rfq_id``, ``run_id`` and idempotency key. Re-declari
 the same identity with the same content is a no-op (the rows are reused);
 re-declaring it with different content, or reusing a key for a different RFQ,
 is a typed refusal that names the fields - intake history is append-only and
-nothing here rewrites it.
+nothing here rewrites it. A replay is accepted only while the run is
+field-for-field the untouched initial attempt this path wrote: every lifecycle
+column is compared, so a run that a later phase has started, retried, finished
+or re-parented is refused rather than silently rejoined.
+
+**The get-or-create runs under the write lock.** :func:`provision_intake` takes
+SQLite's write lock (``BEGIN IMMEDIATE``) *before* its existence reads, so two
+first deliveries of the same message serialise: the second one reads the row the
+first committed and reports it as already stored, instead of racing a deferred
+read into a constraint failure. A caller that is already inside a transaction
+keeps it; the lock is then its own to hold.
+
+The same complete check is exported as :func:`require_intake_preconditions`, so a
+caller can re-assert it inside a later write transaction (the quote write path
+does exactly that) and close the gap between "intake looked untouched" and "the
+rows were written".
 
 What this module deliberately does not write: attachments, thread links,
 supersession, refusal events or run transitions. ``intake_events`` records
@@ -44,7 +59,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Self
 
 from pydantic import StringConstraints, ValidationError, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from rfq_agent.domain.ids import IdempotencyKey, RfqId, RunId
 from rfq_agent.domain.intake import InboundRfq, IntakeEventKind, RfqStatus, SourceChannel
@@ -73,6 +88,7 @@ __all__ = [
     "StoredIntake",
     "load_source",
     "provision_intake",
+    "require_intake_preconditions",
     "require_prerequisites",
 ]
 
@@ -105,6 +121,25 @@ _RFQ_CONTENT_FIELDS: tuple[str, ...] = (
     "superseded_by_rfq_id",
 )
 
+#: Every run field the declaration owns: the whole initial lifecycle. A stored
+#: run is "untouched" only when all of them still agree - ``state`` and
+#: ``outcome`` alone would let a started, retried or re-parented attempt pass as
+#: one nothing had happened to.
+_RUN_CONTENT_FIELDS: tuple[str, ...] = (
+    "rfq_id",
+    "attempt_no",
+    "trigger",
+    "state",
+    "prior_run_id",
+    "outcome",
+    "failure_code",
+    "retry_count",
+    "checkpoint_stage",
+    "row_version",
+    "started_at",
+    "finished_at",
+)
+
 
 class IntakeError(Exception):
     """Base class for intake failures; messages are never rendered by a CLI."""
@@ -131,6 +166,8 @@ class IntakeConflictKind(StrEnum):
     KEY_REUSED = "KEY_REUSED"
     #: The declared run exists but is no longer the untouched ``RECEIVED`` attempt.
     LIFECYCLE_MOVED = "LIFECYCLE_MOVED"
+    #: The stored RFQ a caller expected to read back is no longer there.
+    INTAKE_MISSING = "INTAKE_MISSING"
 
 
 class IntakeConflictError(IntakeError):
@@ -246,11 +283,17 @@ def provision_intake(session: Session, declaration: IntakeDeclaration) -> Stored
     """Store the declared RFQ, its initial run and its ``RECEIVED`` intake event.
 
     Get-or-create, with no overwrite path: a stored row is reused only when it
-    is field-for-field what the declaration states. Anything else is a typed
-    conflict and the caller's transaction is left to roll back.
+    is field-for-field what the declaration states - the RFQ *and* the run's
+    complete lifecycle projection. Anything else is a typed conflict and the
+    caller's transaction is left to roll back.
+
+    The write lock is taken before the existence reads, so a concurrent first
+    delivery serialises behind this one rather than racing its reads.
 
     Args:
         session: The unit of work both rows are written in. The caller commits.
+            A session that has not begun a transaction gets ``BEGIN IMMEDIATE``;
+            one that already has keeps its own transaction and lock discipline.
         declaration: The stated content, identity and arrival instant.
 
     Returns:
@@ -260,12 +303,12 @@ def provision_intake(session: Session, declaration: IntakeDeclaration) -> Stored
         IntakeConflictError: When the identity is stored with different content,
             the idempotency key belongs to another RFQ, or the run has moved on.
     """
+    _begin_write(session)
     source = declaration.to_source()
     expected = _rfq_row(declaration, source)
     stored = session.get(RfqRow, declaration.rfq_id)
     if stored is not None:
-        _require_identical(stored, expected)
-        _require_untouched_run(session, declaration)
+        require_intake_preconditions(session, declaration, stored=stored, expected=expected)
         return StoredIntake(rfq_id=declaration.rfq_id, run_id=declaration.run_id, created=False)
     owner = session.scalar(
         select(RfqRow.rfq_id).where(RfqRow.idempotency_key == declaration.idempotency_key)
@@ -354,6 +397,68 @@ def load_source(session: Session, rfq_id: RfqId) -> InboundRfq:
         raise IntakeIntegrityError(msg) from error
 
 
+def _begin_write(session: Session) -> None:
+    """Take SQLite's write lock before this transaction reads anything.
+
+    A deferred transaction that reads before it writes can have its snapshot
+    invalidated by a concurrent commit; the write then fails with
+    ``SQLITE_BUSY_SNAPSHOT`` (or a unique-key violation) instead of observing
+    the row the other writer stored. ``BEGIN IMMEDIATE`` makes the read the
+    last word: the lock is held from the first statement, so a concurrent first
+    delivery waits - within the configured ``busy_timeout`` - and then reads a
+    committed row.
+
+    A session already inside a transaction is left alone: its lock discipline
+    is its own, and nesting ``BEGIN`` is not possible.
+    """
+    if session.in_transaction():
+        return
+    session.execute(text("BEGIN IMMEDIATE"))
+
+
+def require_intake_preconditions(
+    session: Session,
+    declaration: IntakeDeclaration,
+    *,
+    stored: RfqRow | None = None,
+    expected: RfqRow | None = None,
+) -> None:
+    """Refuse unless the stored intake is still exactly what was declared.
+
+    This is the complete check a replay and any later write against the same
+    intake must pass. It compares every field the declaration owns - the RFQ's
+    content, digests and status, and the run's whole lifecycle projection - and
+    names the fields that disagree.
+
+    It is safe to call inside another writer's transaction: the reads then see
+    that transaction's snapshot, which is what makes the quote write path's
+    guard atomic rather than a check-then-write race.
+
+    Args:
+        session: The unit of work to read through. Nothing is written here.
+        declaration: The stated content, identity and arrival instant.
+        stored: The RFQ row, when the caller already read it in this unit of
+            work. Re-read only when omitted.
+        expected: The RFQ row the declaration states, when already built.
+
+    Raises:
+        IntakeConflictError: When the RFQ is missing or differs from the
+            declaration (``CONTENT_DIFFERS``/``INTAKE_MISSING``), or the run is
+            no longer the untouched initial attempt (``LIFECYCLE_MOVED``).
+    """
+    row = stored if stored is not None else session.get(RfqRow, declaration.rfq_id)
+    if row is None:
+        msg = (
+            "the declared RFQ is no longer stored: intake history cannot be verified, "
+            "so nothing may be written against it"
+        )
+        raise IntakeConflictError(IntakeConflictKind.INTAKE_MISSING, msg)
+    _require_identical(
+        row, expected if expected is not None else _rfq_row(declaration, declaration.to_source())
+    )
+    _require_untouched_run(session, declaration)
+
+
 def _require_identical(stored: RfqRow, expected: RfqRow) -> None:
     """Refuse a stored row that is not field-for-field the declared one."""
     mismatches = [
@@ -369,18 +474,29 @@ def _require_identical(stored: RfqRow, expected: RfqRow) -> None:
 
 
 def _require_untouched_run(session: Session, declaration: IntakeDeclaration) -> None:
-    """Refuse unless the stored run is still the untouched initial attempt."""
+    """Refuse unless the stored run is field-for-field the untouched attempt.
+
+    ``state`` and ``outcome`` are not enough: a run that a worker started and
+    then left in ``RECEIVED`` again, a retried attempt, a re-parented run or one
+    whose version moved all describe history this path did not write. They are
+    compared like every other lifecycle column, and named when they differ.
+    """
     run = session.get(RunRow, declaration.run_id)
-    if (
-        run is None
-        or run.rfq_id != declaration.rfq_id
-        or run.attempt_no != 1
-        or run.state is not RunState.RECEIVED
-        or run.outcome is not None
-    ):
+    if run is None:
         msg = (
-            "the declared run already exists in a different lifecycle position: this "
-            "path only rejoins an untouched RECEIVED attempt, and never reopens a run"
+            "the declared run is missing: intake stores the initial attempt, so a "
+            "declaration cannot rejoin history that is not there"
+        )
+        raise IntakeConflictError(IntakeConflictKind.LIFECYCLE_MOVED, msg)
+    expected = _run_row(declaration)
+    mismatches = [
+        name for name in _RUN_CONTENT_FIELDS if getattr(run, name) != getattr(expected, name)
+    ]
+    if mismatches:
+        msg = (
+            "the declared run is no longer the untouched initial attempt "
+            f"({', '.join(mismatches)}): this path never reopens, retries or re-parents "
+            "a run, and refuses to rejoin one whose lifecycle moved"
         )
         raise IntakeConflictError(IntakeConflictKind.LIFECYCLE_MOVED, msg)
 

@@ -22,6 +22,20 @@ What it adds is the order, the boundaries and the outcome vocabulary:
   belongs to a gate that never ran. Rather than invent one, this module returns
   the refusal as a typed outcome and stores nothing beyond the intake rows.
   That limitation is deliberate and is printed by the command.
+* **the write re-checks the history it is joining, atomically.** Intake
+  commits, quoting happens in later transactions, and another worker may move
+  the run in between. The quote write therefore owns one transaction that takes
+  SQLite's write lock, re-asserts
+  :func:`rfq_agent.intake.require_intake_preconditions`, and only then writes the
+  claim and the rows: a run that advanced, finished or was re-parented - or a
+  source that changed - is a ``CONFLICT`` with nothing stored, never a quote
+  attached to an impossible history. Checking and writing in the same
+  transaction is what removes the window a second writer could slip through.
+* **contention is bounded and typed.** Two first deliveries of the same message
+  serialise in intake (``BEGIN IMMEDIATE``); a lock that outlives that is
+  retried a fixed number of times and then surfaced as
+  :class:`AcceptanceContentionError` - never retried forever, and never
+  reported as a business outcome.
 * **the human gate is untouched.** Nothing here approves, sends, transitions a
   run, stores a gate decision or writes a human action; the quote is a ``DRAFT``
   a human must still review, and the gate's verdict is reported and discarded.
@@ -35,6 +49,8 @@ names a declaration that contradicts stored history.
 
 from __future__ import annotations
 
+import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -42,12 +58,14 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Self, TypeVar
 
 from pydantic import Field, ValidationError, model_validator
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from rfq_agent.domain.extraction import ExtractionResult
 from rfq_agent.domain.ids import LineItemId, QuoteId, QuoteNumber
 from rfq_agent.domain.intake import InboundRfq
-from rfq_agent.domain.quote import QuoteLine, QuoteStatus
+from rfq_agent.domain.policy import QuoteBlockedLedger
+from rfq_agent.domain.quote import QuoteCalculation, QuoteLine, QuoteStatus
 from rfq_agent.domain.resolution import (
     CustomerMatchStatus,
     ResolutionMatchStatus,
@@ -63,18 +81,25 @@ from rfq_agent.intake import (
     StoredIntake,
     load_source,
     provision_intake,
+    require_intake_preconditions,
 )
 from rfq_agent.persistence.repositories import BusinessReader
-from rfq_agent.persistence.writers import QuoteWriter
+from rfq_agent.persistence.writers import persist_quote
 from rfq_agent.quote_adapter import ClaimValidationError, to_quote_request
 from rfq_agent.quoting import QuoteRunStatus, run_quote
 from rfq_agent.resolving import bind_customer, resolve_lines
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from sqlalchemy.orm import Session
+
     from rfq_agent.persistence.engine import Database
+    from rfq_agent.persistence.writers import QuoteWriteResult
     from rfq_agent.quoting import QuoteRequest
 
 __all__ = [
+    "AcceptanceContentionError",
     "AcceptanceError",
     "AcceptanceOutcome",
     "AcceptanceReason",
@@ -84,6 +109,15 @@ __all__ = [
 ]
 
 _T = TypeVar("_T")
+
+#: How many times one write is attempted while SQLite reports the database
+#: locked. Bounded on purpose: total wait is the three backoffs below plus the
+#: connections' own ``busy_timeout``, so a caller learns the database is not
+#: available in under a second rather than blocking indefinitely.
+_WRITE_ATTEMPTS = 4
+
+#: Backoff between attempts. Length is ``_WRITE_ATTEMPTS - 1``.
+_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.15, 0.3)
 
 
 class AcceptanceOutcome(StrEnum):
@@ -121,7 +155,16 @@ class AcceptanceReason(StrEnum):
 
 
 class AcceptanceError(Exception):
-    """An internal invariant of the acceptance composition was violated."""
+    """Base class for acceptance failures; messages are never rendered by a CLI."""
+
+
+class AcceptanceContentionError(AcceptanceError):
+    """The database stayed locked for the whole bounded retry budget.
+
+    Raised only after every attempt was refused with SQLite's busy/locked
+    status. It is not a business outcome: nothing can be said about what was
+    stored, so the caller must retry rather than read it as ``CONFLICT``.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,12 +271,16 @@ def accept_rfq(request: FreshRfq, database: Database) -> AcceptanceReport:
     2. the resolver binds the customer and rules on every claimed line;
     3. the adapter verifies the claims against the stored source and builds the
        quote request, or refuses it;
-    4. the quote engine decides over the business data, and the accepted write
-       path stores the calculation and its ledger in one transaction.
+    4. the quote engine decides over the business data, and one transaction -
+       holding the write lock - re-checks the stored intake and the run's whole
+       lifecycle projection before it writes the claim, the calculation and the
+       ledger.
 
     Every refusal is a typed outcome. Nothing is persisted for a refusal beyond
     the intake rows the first step already committed, and nothing here writes a
     gate decision, a run transition, an approval or an outbound message.
+    A run another worker moved between intake and this write is a ``CONFLICT``
+    with no quote stored, never a quote attached to a history it never had.
 
     Args:
         request: The declaration: content, identity, claims and instants.
@@ -245,20 +292,19 @@ def accept_rfq(request: FreshRfq, database: Database) -> AcceptanceReport:
     Raises:
         AcceptanceError: Only if a completed run's artefacts are missing, which
             the accepted contracts already make unrepresentable.
+        AcceptanceContentionError: When every bounded write attempt was refused
+            because another connection held the database. Nothing is claimed
+            about what was stored; the caller retries.
+        OperationalError: A database failure that is not lock contention. It
+            propagates unchanged rather than being classified as an outcome.
     """
     try:
-        with database.session() as session:
-            stored = provision_intake(session, request.intake)
+        stored = _store_intake(request, database)
     except IntakeConflictError as error:
-        reason = (
-            AcceptanceReason.STORED_STATE_CONFLICT
-            if error.kind is IntakeConflictKind.LIFECYCLE_MOVED
-            else AcceptanceReason.IDENTITY_CONFLICT
-        )
-        return _refused(request, AcceptanceOutcome.CONFLICT, reason)
+        return _refused(request, AcceptanceOutcome.CONFLICT, _conflict_reason(error))
     except IntegrityError:
         # The database's own uniqueness rules are the real guarantee; a race
-        # that slips past the explicit checks lands here.
+        # that outlived the bounded retries still lands here as a contradiction.
         return _refused(request, AcceptanceOutcome.CONFLICT, AcceptanceReason.IDENTITY_CONFLICT)
 
     with database.session_factory() as session:
@@ -319,7 +365,18 @@ def accept_rfq(request: FreshRfq, database: Database) -> AcceptanceReport:
         decision = _require(result.decision, "gate decision")
 
     try:
-        write = QuoteWriter(database).persist(calculation, ledger)
+        write = _persist_quote(database, request, calculation, ledger)
+    except IntakeConflictError as error:
+        # The run moved (or the source changed) between intake and this write.
+        # The check and the rows shared one transaction, so nothing was stored.
+        return _refused(
+            request,
+            AcceptanceOutcome.CONFLICT,
+            _conflict_reason(error),
+            stored=stored,
+            customer=customer,
+            statuses=statuses,
+        )
     except IntegrityError:
         # A different calculation for a run that already has one: the database
         # refuses a second revision, so this is a contradiction, not a retry.
@@ -368,6 +425,104 @@ def accept_rfq(request: FreshRfq, database: Database) -> AcceptanceReport:
         eligible_for_review=decision.eligible_for_human_review,
         approval_required=decision.requires_human_approval,
     )
+
+
+def _store_intake(request: FreshRfq, database: Database) -> StoredIntake:
+    """Store the declaration, retrying a bounded number of times on lock contention.
+
+    ``provision_intake`` takes the write lock before it reads, so an identical
+    concurrent first delivery waits rather than racing - but a lock held longer
+    than the connection's ``busy_timeout`` still surfaces as ``OperationalError``.
+    That is not an outcome about this request, so it is retried a fixed number
+    of times and then reported as :class:`AcceptanceContentionError`.
+    """
+    return _with_busy_retry(
+        lambda: _in_session(database, lambda session: provision_intake(session, request.intake)),
+        on_exhausted=AcceptanceContentionError(
+            "the database stayed locked while storing the intake; nothing is claimed about "
+            "what was stored - retry the request"
+        ),
+    )
+
+
+def _persist_quote(
+    database: Database,
+    request: FreshRfq,
+    calculation: QuoteCalculation,
+    ledger: QuoteBlockedLedger,
+) -> QuoteWriteResult:
+    """Write the accepted artefacts in one transaction that re-checks the history.
+
+    Three things happen inside a single unit of work, in this order:
+
+    1. ``BEGIN IMMEDIATE`` takes SQLite's write lock, so no other writer can
+       commit between the check and the rows;
+    2. :func:`rfq_agent.intake.require_intake_preconditions` re-asserts - against
+       a snapshot nothing can move - that the RFQ is still the declared one and
+       the run is still the untouched attempt intake wrote;
+    3. :func:`rfq_agent.persistence.writers.persist_quote` takes the claim and
+       writes the header, the lines and the ledger.
+
+    A refusal at step 2 leaves no claim and no quotation: the unit of work is
+    rolled back whole, so a retry is free rather than "already done".
+    """
+
+    def write() -> QuoteWriteResult:
+        with database.session() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            require_intake_preconditions(session, request.intake)
+            return persist_quote(session, calculation, ledger)
+
+    return _with_busy_retry(
+        write,
+        on_exhausted=AcceptanceContentionError(
+            "the database stayed locked while storing the quote; nothing is claimed about "
+            "what was stored - retry the request"
+        ),
+    )
+
+
+def _in_session(database: Database, operation: Callable[[Session], _T]) -> _T:
+    """Run ``operation`` in one unit of work and return its result."""
+    with database.session() as session:
+        return operation(session)
+
+
+def _with_busy_retry(operation: Callable[[], _T], *, on_exhausted: Exception) -> _T:
+    """Run ``operation``, retrying only SQLite lock contention, a fixed number of times.
+
+    Only the busy/locked family is retried. Every other ``OperationalError``
+    (a missing table, a corrupt file) propagates on the first attempt: retrying
+    it would hide a defect behind a delay.
+    """
+    last: OperationalError | None = None
+    for attempt in range(_WRITE_ATTEMPTS):
+        try:
+            return operation()
+        except OperationalError as error:
+            if not _is_busy(error):
+                raise
+            last = error
+            if attempt < len(_RETRY_BACKOFF_SECONDS):
+                time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+    raise on_exhausted from last
+
+
+def _is_busy(error: OperationalError) -> bool:
+    """Whether ``error`` is SQLite reporting lock contention on this connection."""
+    origin = getattr(error, "orig", None)
+    return isinstance(origin, sqlite3.OperationalError) and "locked" in str(origin).casefold()
+
+
+def _conflict_reason(error: IntakeConflictError) -> AcceptanceReason:
+    """Classify an intake refusal from its closed-vocabulary kind, never its text.
+
+    "This identity is not what it claims to be" is an identity conflict; "the
+    history this request would join has moved" is a stored-state conflict.
+    """
+    if error.kind in (IntakeConflictKind.CONTENT_DIFFERS, IntakeConflictKind.KEY_REUSED):
+        return AcceptanceReason.IDENTITY_CONFLICT
+    return AcceptanceReason.STORED_STATE_CONFLICT
 
 
 def _quote_request(

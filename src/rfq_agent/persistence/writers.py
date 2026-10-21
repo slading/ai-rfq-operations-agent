@@ -26,6 +26,13 @@ line has no price row". ``quote_lines.price_entry_id`` is nullable and foreign -
 keyed (D-1), so the sentinel is translated to ``NULL`` at this boundary, and the
 pairing is enforced by ``ck_quote_lines_price_provenance_pairing`` in both
 directions. The domain object is never modified.
+
+**A caller that owns a transaction can write inside it.** :func:`persist_quote`
+is the same write, expressed against a session the caller opened, so a caller
+whose precondition must hold *at the moment of writing* can hold one transaction
+around both the check and the rows instead of checking and then writing through
+a second transaction. It takes no additional decision: the claim, the rows and
+the sentinel translation are the ones above.
 """
 
 from __future__ import annotations
@@ -60,6 +67,7 @@ __all__ = [
     "QuoteWriteResult",
     "QuoteWriter",
     "SqlIdempotencyStore",
+    "persist_quote",
     "quote_line_id",
 ]
 
@@ -184,6 +192,10 @@ class QuoteWriter:
     ) -> QuoteWriteResult:
         """Store ``calculation`` and ``ledger``; write nothing on a retry.
 
+        Opens the one transaction :func:`persist_quote` documents and hands the
+        work to it, so a caller that already owns a transaction gets the same
+        write without this one opening a second.
+
         Args:
             calculation: The accepted arithmetic outcome. Its lines are written in
                 ordinal order, and a non-``FOUND`` line's ``PRICE_MISSING``
@@ -204,33 +216,82 @@ class QuoteWriter:
             RuntimeError: If a claim exists without the rows it claims (a defect
                 that cannot be produced by a commit, and so is never expected).
         """
-        quote = calculation.quote
-        _check_the_ledger_belongs_to_the_quote(quote, ledger)
-        operation_key = _operation_key(calculation, ledger)
-
         with self._database.session() as session:
-            claims = SqlIdempotencyStore(session, clock=self._clock)
-            if not claims.claim(operation_key, scope=CLAIM_SCOPE, ttl_seconds=claim_ttl_seconds):
-                return _stored_result(session, quote.quote_id)
-
-            rfq_id = _rfq_id_for(session, quote.run_id)
-            lines = _line_rows(quote)
-            written_at = self._clock.now()
-            # Level by level, then flush: the models declare no relationships, so
-            # the unit of work has no dependency order to sort by - and the
-            # foreign keys are enforced.
-            session.add(_quote_row(quote, rfq_id=rfq_id))
-            session.flush()
-            session.add_all(lines)
-            session.add_all(_ledger_rows(ledger, written_at=written_at))
-            session.flush()
-
-            return QuoteWriteResult(
-                quote_id=quote.quote_id,
-                line_ids=tuple(row.line_id for row in lines),
-                ledger_seqs=tuple(range(1, len(ledger.reasons) + 1)),
-                duplicate=False,
+            return persist_quote(
+                session,
+                calculation,
+                ledger,
+                clock=self._clock,
+                claim_ttl_seconds=claim_ttl_seconds,
             )
+
+
+def persist_quote(
+    session: Session,
+    calculation: QuoteCalculation,
+    ledger: QuoteBlockedLedger,
+    *,
+    clock: Clock | None = None,
+    claim_ttl_seconds: int | None = None,
+) -> QuoteWriteResult:
+    """Store one calculation and its ledger inside the caller's unit of work.
+
+    This is :meth:`QuoteWriter.persist` with the transaction left to the caller.
+    It exists for one reason: a caller for whom *something else must still be
+    true* can then check it and write the rows in a single transaction, instead
+    of checking in one transaction and writing in the next - the gap between
+    those two is exactly where a concurrent writer can prove the check wrong.
+
+    Nothing else changes. The claim is still taken first, with ``ON CONFLICT DO
+    NOTHING``, so a replay writes nothing and reports what is stored; the rows
+    are still written level by level; and a batch that does not make it to
+    commit - because this function raised, or because the caller rolled back -
+    leaves no claim and no quotation behind.
+
+    Args:
+        session: The caller's unit of work. The caller commits or rolls back.
+        calculation: The accepted arithmetic outcome.
+        ledger: The projection for exactly this quote and run.
+        clock: Source of the ledger rows' ``created_at``; the system clock when
+            omitted.
+        claim_ttl_seconds: Optional lifetime for the idempotency claim.
+
+    Returns:
+        What was stored, with ``duplicate`` true when the claim was already held.
+
+    Raises:
+        ValueError: If the ledger does not belong to this quote and run, if the
+            run does not exist, or if a line's provenance contradicts its price
+            status.
+        RuntimeError: If a claim exists without the rows it claims.
+    """
+    effective_clock = clock if clock is not None else SystemClock()
+    quote = calculation.quote
+    _check_the_ledger_belongs_to_the_quote(quote, ledger)
+    operation_key = _operation_key(calculation, ledger)
+
+    claims = SqlIdempotencyStore(session, clock=effective_clock)
+    if not claims.claim(operation_key, scope=CLAIM_SCOPE, ttl_seconds=claim_ttl_seconds):
+        return _stored_result(session, quote.quote_id)
+
+    rfq_id = _rfq_id_for(session, quote.run_id)
+    lines = _line_rows(quote)
+    written_at = effective_clock.now()
+    # Level by level, then flush: the models declare no relationships, so the
+    # unit of work has no dependency order to sort by - and the foreign keys are
+    # enforced.
+    session.add(_quote_row(quote, rfq_id=rfq_id))
+    session.flush()
+    session.add_all(lines)
+    session.add_all(_ledger_rows(ledger, written_at=written_at))
+    session.flush()
+
+    return QuoteWriteResult(
+        quote_id=quote.quote_id,
+        line_ids=tuple(row.line_id for row in lines),
+        ledger_seqs=tuple(range(1, len(ledger.reasons) + 1)),
+        duplicate=False,
+    )
 
 
 def _check_the_ledger_belongs_to_the_quote(quote: Quote, ledger: QuoteBlockedLedger) -> None:

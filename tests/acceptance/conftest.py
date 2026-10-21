@@ -57,6 +57,19 @@ def seeded(request: pytest.FixtureRequest) -> Database:
     return database
 
 
+@pytest.fixture
+def seeded_url(request: pytest.FixtureRequest) -> str:
+    """The seeded database's URL, for tests that open their own connections.
+
+    Requested by name for the same reason :func:`seeded` is: this module
+    re-exports the persistence fixtures, so a parameter of the same name would
+    shadow them before pytest could resolve it.
+    """
+    request.getfixturevalue("seeded")
+    path: Path = request.getfixturevalue("database_path")
+    return f"sqlite:///{path}"
+
+
 def make_declaration(
     *,
     number: int = 1,

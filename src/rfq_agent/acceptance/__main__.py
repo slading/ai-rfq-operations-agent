@@ -12,7 +12,9 @@ Exit codes name the outcome, so a script can branch without parsing the report:
   request was already stored and nothing new was written;
 * ``3`` - a human must act before quoting; nothing was stored beyond intake;
 * ``2`` - the declaration contradicts stored history (``CONFLICT``);
-* ``1`` - the declaration, the database or the run itself failed.
+* ``1`` - the declaration, the database or the run itself failed. A database
+  that stayed locked for the whole bounded retry budget reports here too: it is
+  not a business outcome, and nothing is claimed about what was stored.
 
 Untrusted content is never printed. The report carries identifiers, enum
 values, amounts and fixed sentences; the body, the subject and the sender
@@ -31,6 +33,7 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 from rfq_agent.acceptance import (
+    AcceptanceContentionError,
     AcceptanceOutcome,
     AcceptanceReason,
     AcceptanceReport,
@@ -168,6 +171,13 @@ def _report_failure(failure: Exception) -> int:
         print(
             "error: acceptance prerequisites missing; run `alembic upgrade head` "
             "if the schema is missing, or `make seed` if the dataset is missing",
+            file=sys.stderr,
+        )
+        return 1
+    if isinstance(failure, AcceptanceContentionError):
+        print(
+            "error: the database stayed locked; nothing is claimed about what was stored "
+            "- retry the request",
             file=sys.stderr,
         )
         return 1

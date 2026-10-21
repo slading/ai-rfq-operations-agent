@@ -119,6 +119,33 @@ Expected after A, B and C (in that order):
 
 After Case D: every count above is unchanged.
 
+## Concurrency and lifecycle guarantees
+
+Four properties are enforced and regression-tested; each was a review finding on
+the first version of this slice.
+
+* **The write re-checks the history it joins, atomically.** The quote is written
+  in a transaction that first takes SQLite's write lock (`BEGIN IMMEDIATE`) and
+  then re-asserts the stored intake and the run's complete lifecycle projection.
+  A run another worker advanced or terminated between intake and this write is a
+  `CONFLICT` with **nothing** stored — no quote, no line, and no idempotency
+  claim left behind. Checking and writing in one transaction is what removes the
+  window a second writer could slip through.
+* **A replay rejoins only an untouched run.** "Untouched" is every lifecycle
+  column — trigger, attempt number, prior run, outcome, failure code, retry
+  count, checkpoint stage, row version and both timestamps — not just `state`
+  and `outcome`. A run anything else has started, retried, re-parented or
+  finished is refused, never silently rejoined.
+* **First deliveries serialise, they do not race.** Intake takes the write lock
+  before its existence reads, so two simultaneous deliveries of the same message
+  end with one set of rows and an idempotent `DUPLICATE` for the second — not a
+  constraint failure reported as a conflict.
+* **Contention is bounded and typed.** A database that stays locked is retried a
+  fixed handful of times (four attempts, 0.05 s / 0.15 s / 0.3 s backoff, each
+  also bounded by the connection's `busy_timeout`) and then reported as a
+  contention error — never retried forever, and never classified as a business
+  outcome. Every other `OperationalError` propagates on the first attempt.
+
 ## What this slice reuses, unchanged
 
 `bind_customer` (exact alias identity only), `resolve_lines`, `to_quote_request`
@@ -143,3 +170,7 @@ nothing imports `rfq_agent.demo`.
   price between two runs is refused rather than silently becoming revision 2.
 * **Exact-only binding.** A sender proven by a name or a mail domain still needs
   a human; this path has no operator binding, unlike the demo's fixtures.
+* **Contention is a failure, not an outcome.** If the database stays locked past
+  the bounded retry budget, the command exits `1` and claims nothing about what
+  was stored. Re-running the same declaration is always safe: it either writes
+  once or reports `DUPLICATE`.
