@@ -1,0 +1,35 @@
+{
+  "intake": {
+    "rfq_id": "RFQ_ACC_0003",
+    "run_id": "RUN_ACC_0003",
+    "idempotency_key": "acceptance:case-c:0003",
+    "source_channel": "EMAIL",
+    "received_at": "2026-10-06T09:10:00Z",
+    "subject": "RFQ: 25 pcs 100-ABC",
+    "body": "Hello,\nplease quote 25 pcs of 100-ABC for our standard replenishment.\nNo specific delivery date is required.\nBest regards,\nNordwind Einkauf",
+    "sender_name": "Nordwind Einkauf",
+    "sender_email": "einkauf@nordwind-industrie.de"
+  },
+  "quote_id": "QTE_ACC_0003",
+  "quote_number": "Q-2026-8103",
+  "line_item_ids": ["LI_ACC_0003"],
+  "pricing_as_of": "2026-10-06",
+  "stock_as_of": "2026-10-01T06:00:00Z",
+  "extraction": {
+    "lines": [
+      {
+        "ordinal": 1,
+        "raw_text": "please quote 25 pcs of 100-ABC for our standard replenishment.",
+        "requested_sku": "100-ABC",
+        "description": "Centrifugal pump PMP-A-100",
+        "quantity": 26,
+        "uom": "pcs",
+        "evidence": "26 pcs of 100-ABC",
+        "confidence": "1"
+      }
+    ],
+    "requested_delivery": {
+      "resolution": "ABSENT"
+    }
+  }
+}

@@ -16,6 +16,7 @@ import pytest
 import rfq_agent
 
 MODULES = [
+    "rfq_agent.acceptance",
     "rfq_agent.config",
     "rfq_agent.contracts",
     "rfq_agent.contracts.errors",
@@ -44,6 +45,7 @@ MODULES = [
     "rfq_agent.domain.trust",
     "rfq_agent.domain.values",
     "rfq_agent.domain.workflow",
+    "rfq_agent.intake",
     "rfq_agent.workflow",
     "rfq_agent.workflow.transitions",
     "rfq_agent.observability",

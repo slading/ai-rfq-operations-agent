@@ -145,6 +145,26 @@ account is fine" — while `project_blocked_ledger`'s accepted five-fact mapping
 unchanged. Nothing is approved, sent, transitioned or promoted: the quote stays a
 draft, no gate outcome is persisted yet, and no row changes.
 
+**Project 04 — fresh RFQ acceptance.** The first production intake path. Until
+now every quotation was reached from a fixture that a demo-scoped shim had
+already stored; `src/rfq_agent/intake.py` now owns the write path for an RFQ
+that really arrived. A caller declares one fresh request — source text, sender,
+`received_at`, the identifiers only a system may hold, and the extraction
+*claims* an LLM would have produced — and `src/rfq_agent/acceptance/` composes
+the accepted components in their accepted order: store the intake, read the
+source **back from the database** with both digests re-checked, bind the
+customer, resolve the lines, verify the claims, run the deterministic quote,
+persist the DRAFT. Nothing is re-implemented and nothing is weakened: the
+customer is still bound only by exact stored-alias identity, the claims are
+still verified by the same closed-grammar recogniser against the stored source,
+and the write is still one transaction with a content-derived idempotency claim.
+The outcome is one of five typed values — a draft awaiting human review, a
+blocked draft, a duplicate replay, a pre-quote refusal that needs a human, or a
+conflict with stored history — and a refusal is reported, not persisted: the
+schema has no state for it, so none is invented. No schema, migration,
+dependency or provider changed; nothing is approved, sent, transitioned or
+gate-stored.
+
 No provider calls, agent loop, worker, approval, outbound message or UI yet; the
 gate decision is not persisted yet either — Phase 1K decides, and the write path
 for its evidence is the next phase.
@@ -254,6 +274,53 @@ target the same file. Note one accepted-behaviour quirk: the seed command
 explicitly to both `python -m rfq_agent.seed` and `python -m rfq_agent.demo`.
 Unifying the seed command with the same one-line resolution is a documented
 follow-up, not part of this phase.
+
+## Fresh RFQ acceptance (Project 04)
+
+```bash
+make migrate && make seed
+python -m rfq_agent.acceptance --input docs/acceptance/case-a-clean.json
+```
+
+This is the production intake path, not another fixture: the declaration names
+the RFQ, the run, the quote, the extraction claims and every instant, and the
+command stores the request, verifies the claims against the stored source, runs
+the deterministic quote and persists a DRAFT. Three worked examples live in
+`docs/acceptance/`; their expected output and the rows to check are documented
+in `docs/acceptance/README.md`.
+
+* **Case A** — 25 × `100-ABC` from the seeded sender. The stored DRAFT totals
+  **28 750.00 EUR**, has no blocking reason, and carries no approval.
+* **Case B** — 200 × `100-ABC`, more than the 145 available. The DRAFT totals
+  **230 000.00 EUR** and one `STOCK_INSUFFICIENT` row is persisted; the gate
+  reports the quote ineligible for human review.
+* **Case C** — the source asks for 25, the claim asserts 26. Claim verification
+  refuses with `EVIDENCE_NOT_VERBATIM` and `QUANTITY_UNSUPPORTED`; no quote and
+  no quote line is written. (Replaying Case A is Case D: `DUPLICATE`, nothing new
+  written.)
+
+Exit codes name the outcome: `0` for a persisted or duplicated DRAFT, `3` when a
+human must act before quoting, `2` for a conflict with stored history, `1` for a
+declaration, prerequisite or run failure. The command prints no body text, no
+subject and no sender address, and reduces every exception to fixed text.
+
+The quote is written under a guard that shares its transaction: the write takes
+SQLite's write lock first and then re-asserts the stored intake, the source's
+completeness (an RFQ that acquired attachment metadata is refused, exactly as
+`load_source` refuses it) and the run's **complete** lifecycle projection, so a
+run another worker advanced or terminated between intake and the write is a
+`CONFLICT` with nothing stored — no quote, no line and no claim. Intake likewise takes the write lock before its
+existence reads, so two first deliveries of one message serialise into one set of
+rows and an idempotent `DUPLICATE` rather than a constraint race; contention that
+outlives a fixed, small retry budget is reported as such instead of being
+retried indefinitely or mistaken for a business outcome.
+
+Limits, stated plainly: the intake is a structured declaration — there is no
+model, no provider and no parser behind it; a pre-quote refusal is returned but
+**not persisted**, because no accepted state records one; the run is left in
+`RECEIVED` with no transition and no `run_event`; the gate decision is printed
+and discarded; and a second, *different* quotation for a run that already has one
+is refused as a `CONFLICT` rather than becoming revision 2.
 
 ## F1/F2 quotation trust boundary
 
