@@ -133,6 +133,12 @@ class GroqSettings(_ConfiguredModel):
     requests_per_minute_budget: int = Field(default=24, ge=1, le=10_000)
     tokens_per_minute_budget: int = Field(default=7_000, ge=1, le=10_000_000)
     request_timeout_seconds: Decimal = Field(default=Decimal("30"), gt=0, le=300)
+    #: Hard ceiling on one completion, in tokens. The extraction needs a few
+    #: hundred; the bound is what makes a single call's cost known in advance.
+    max_output_tokens: int = Field(default=1_024, ge=64, le=32_768)
+    #: Hard ceiling on one response body, in bytes. A larger response is refused
+    #: rather than buffered: it cannot be a useful structured extraction.
+    max_response_bytes: int = Field(default=262_144, ge=1_024, le=4_194_304)
 
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
 
