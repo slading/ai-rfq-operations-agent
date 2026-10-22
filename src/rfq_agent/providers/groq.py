@@ -26,10 +26,21 @@ within that cap. Bad output is never retried here - a repair is a pipeline
 policy, and this slice has none. Exhausting the attempts is a reported failure,
 never a best-effort guess.
 
-**Every call is bounded.** A per-request timeout, a maximum number of generated
-tokens, a maximum number of attempts and a maximum response size in bytes. The
-response reader stops one byte past the ceiling and refuses the body rather than
-buffering whatever the provider sends.
+**Every call is bounded, in wall-clock terms.** Each attempt gets one monotonic
+deadline: the connect and header read are bounded by it, and the body is read in
+chunks with the remaining budget re-checked and re-armed on the response socket
+before each chunk, so a response that trickles one byte at a time still times out
+instead of running indefinitely. Alongside the deadline there is a ceiling on
+generated tokens, a maximum number of attempts, and a maximum response size in
+bytes - the reader stops one byte past the ceiling and refuses the body rather
+than buffering whatever the provider sends.
+
+**Redirects are never followed.** ``urllib`` replays a redirected request with
+the original headers minus only the content headers, which would forward the
+``Authorization`` header to whatever host the response names, and it permits an
+``https`` to ``http`` downgrade. The transport therefore installs a redirect
+handler that declines every 3xx, and a 3xx status is a non-retryable typed
+failure - no second request is ever made.
 
 **Structured output is validated locally, not trusted.** The adapter asks for
 JSON mode and validates the payload against the domain schema itself over
@@ -45,8 +56,10 @@ any message this module builds.
 
 from __future__ import annotations
 
+import http.client
 import json
 import secrets
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -128,6 +141,15 @@ _MAX_TIMEOUT_SECONDS = 300
 #: The only status that carries a usable body.
 _HTTP_OK = 200
 
+#: A redirect is never followed. See :class:`_RefuseRedirects`.
+_REDIRECT_MIN = 300
+_REDIRECT_MAX = 400
+
+#: How much of a response body one underlying read may return. Small enough that
+#: the remaining wall-clock budget is re-checked often, large enough that a normal
+#: extraction response is read in a handful of calls.
+_READ_CHUNK_BYTES = 8_192
+
 
 @dataclass(frozen=True, slots=True)
 class HttpRequest:
@@ -158,9 +180,12 @@ class HttpTransport(Protocol):
     """The seam that performs one request.
 
     The default implementation uses :mod:`urllib.request`; tests pass a
-    scripted callable. A transport raises ``TimeoutError`` for a timeout and
-    ``OSError``/``urllib.error.URLError`` for a network failure - it never
-    retries, and it never classifies.
+    scripted callable. A transport raises ``TimeoutError`` for a timeout,
+    ``OSError``/``urllib.error.URLError`` for a network failure and
+    ``http.client.HTTPException`` for a protocol failure - it never retries, and
+    it never classifies. The default transport treats ``timeout_seconds`` as a
+    wall-clock deadline for the whole attempt; a custom transport is expected to
+    honour the same contract.
     """
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
@@ -168,14 +193,60 @@ class HttpTransport(Protocol):
         ...
 
 
-def _urllib_transport(request: HttpRequest) -> HttpResponse:
-    """Perform one HTTPS request with :mod:`urllib.request`.
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that never redirects.
 
-    ``urlopen`` is called with a ``Request`` whose URL was validated to be HTTPS
-    when the provider was built, and with an explicit timeout. The response is
-    read up to one byte past the ceiling so an oversized body is detectable
-    without being buffered in full.
+    ``urllib`` follows 3xx by default, and its redirect request is built from the
+    original request's headers minus only ``Content-Length`` and ``Content-Type``:
+    the ``Authorization`` header - this adapter's provider credential - would be
+    replayed at whatever host the response named, and an ``https`` URL would be
+    allowed to become ``http``. Neither is acceptable for a call carrying a
+    secret, so ``redirect_request`` always declines. Declining (rather than
+    rewriting the URL) means no second transmission is attempted at all: the
+    opener falls back to ``http_error_default``, which raises
+    :class:`urllib.error.HTTPError` for the 3xx response, and the adapter turns
+    that status into a non-retryable typed failure.
     """
+
+    def redirect_request(  # noqa: PLR0917 - urllib's signature, called positionally
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        """Never build a follow-up request, for any status, host or scheme."""
+        del req, fp, code, msg, headers, newurl
+
+
+#: The one opener this adapter uses. ``build_opener`` substitutes this handler for
+#: its own default redirect handler (same class hierarchy), so no other code path
+#: can re-enable redirect following for provider traffic.
+_OPENER = urllib.request.build_opener(_RefuseRedirects())
+
+
+def _now() -> float:
+    """Return the monotonic clock, indirected so the deadline is testable."""
+    return time.monotonic()
+
+
+def _urllib_transport(request: HttpRequest) -> HttpResponse:
+    """Perform one HTTPS request under one wall-clock deadline.
+
+    The budget is a *monotonic deadline*, not a per-socket-operation timeout: it
+    is fixed before connecting, the connect and header read are bounded by it,
+    and the body is read in chunks with the remaining budget re-checked and
+    re-armed before every chunk. A response that trickles one byte at a time
+    therefore cannot outlive the deadline - the reader notices between chunks
+    and raises :class:`TimeoutError`, which the adapter reports as ``TIMEOUT``.
+
+    Redirects are never followed (:class:`_RefuseRedirects`), and the body is read
+    at most one byte past the configured ceiling so an oversized response is
+    detectable without being buffered whole.
+    """
+    deadline = _now() + request.timeout_seconds
     http_request = urllib.request.Request(  # noqa: S310 - scheme enforced by GroqProvider
         request.url,
         data=request.body,
@@ -183,19 +254,19 @@ def _urllib_transport(request: HttpRequest) -> HttpResponse:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(  # noqa: S310 - scheme enforced by GroqProvider
-            http_request, timeout=request.timeout_seconds
-        ) as response:
+        with _OPENER.open(http_request, timeout=request.timeout_seconds) as response:
+            body = _read_bounded(response, request.max_response_bytes, deadline)
             return HttpResponse(
                 status=int(response.status),
-                body=response.read(request.max_response_bytes + 1),
+                body=body,
                 headers=dict(response.headers.items()),
             )
     except urllib.error.HTTPError as error:
-        # A 4xx/5xx is a provider answer, not a transport failure: hand its
-        # status to the classifier. The body is read bounded and never parsed.
+        # A 4xx/5xx - and any 3xx, which is deliberately never followed - is a
+        # provider answer, not a transport failure: hand its status to the
+        # classifier. The body is read bounded and never parsed.
         try:
-            body = error.read(request.max_response_bytes + 1)
+            body = _read_bounded(error, request.max_response_bytes, deadline)
         finally:
             error.close()
         return HttpResponse(
@@ -203,6 +274,68 @@ def _urllib_transport(request: HttpRequest) -> HttpResponse:
             body=body,
             headers=dict(error.headers.items()) if error.headers is not None else {},
         )
+
+
+def _read_bounded(response: object, max_bytes: int, deadline: float) -> bytes:
+    """Read a body up to ``max_bytes + 1`` bytes, or raise ``TimeoutError``.
+
+    Before every chunk the remaining budget is recomputed from the monotonic
+    clock and armed on the response's socket, so the *next* underlying read can
+    never wait past the deadline, and total time is bounded by the deadline plus
+    at most one short read. ``read1`` is used where available because it performs
+    at most one underlying read; a plain ``read`` (all that an
+    :class:`urllib.error.HTTPError` offers) is still bounded by the same budget.
+    """
+    read = getattr(response, "read1", None) or response.read  # type: ignore[attr-defined]
+    chunks: list[bytes] = []
+    budget = max_bytes + 1
+    reached_eof = False
+    while budget > 0:
+        remaining = deadline - _now()
+        if remaining <= 0:
+            msg = "the provider request exceeded its wall-clock deadline"
+            raise TimeoutError(msg)
+        _arm_read_timeout(response, remaining)
+        chunk = read(min(_READ_CHUNK_BYTES, budget))
+        if not chunk:
+            reached_eof = True
+            break
+        chunks.append(chunk)
+        budget -= len(chunk)
+    body = b"".join(chunks)
+    if reached_eof:
+        _require_complete_body(response, body)
+    return body
+
+
+def _require_complete_body(response: object, body: bytes) -> None:
+    """Report a body that ended before its declared ``Content-Length``.
+
+    ``read1`` returns short counts and cannot raise on its own, so a connection
+    that closes mid-body would otherwise look like a complete response and be
+    misreported as unparsable JSON rather than as the retryable protocol failure
+    it is. ``http.client`` keeps the unread byte count in ``length``; a positive
+    remainder after EOF is an :class:`http.client.IncompleteRead`, which the
+    adapter converts into a typed server failure.
+    """
+    remaining = getattr(response, "length", None)
+    if isinstance(remaining, int) and remaining > 0:
+        raise http.client.IncompleteRead(body, remaining)
+
+
+def _arm_read_timeout(response: object, remaining: float) -> None:
+    """Bound the response socket's next read by the remaining budget.
+
+    The socket is reached through the documented ``fp.raw._sock`` shape of
+    :class:`http.client.HTTPResponse`. When it cannot be found - an opaque
+    response object - the deadline is still enforced between chunks, and the
+    socket keeps the timeout it was opened with.
+    """
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if isinstance(sock, socket.socket):
+        sock.settimeout(remaining)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +358,8 @@ class GroqProvider:
             caller; never logged, echoed or included in a failure.
         model: The model identifier, from configuration.
         base_url: HTTPS base URL, from configuration.
-        timeout_seconds: Per-request timeout.
+        timeout_seconds: Wall-clock budget for one attempt, in seconds: a
+            connect/header/body deadline, not a per-socket-operation timeout.
         max_response_bytes: Hard ceiling on a response body.
         max_output_tokens: Default completion-token ceiling when the request
             does not state one.
@@ -405,7 +539,7 @@ class GroqProvider:
             timeout_seconds=self._timeout_seconds,
             max_response_bytes=self._max_response_bytes,
         )
-        started = time.monotonic()
+        started = _now()
         try:
             response = self._transport(request)
         except TimeoutError:
@@ -417,9 +551,22 @@ class GroqProvider:
                 else ProviderErrorCode.SERVER_ERROR
             )
             return _Attempt(self._failure(code, started))
+        except http.client.HTTPException:
+            # Malformed status lines, premature disconnects and truncated bodies
+            # (``IncompleteRead``) are protocol failures of a transport, not
+            # exceptions the pipeline should ever see. They are reported as the
+            # retryable server errors they are.
+            return _Attempt(self._failure(ProviderErrorCode.SERVER_ERROR, started))
         except OSError:
             return _Attempt(self._failure(ProviderErrorCode.SERVER_ERROR, started))
 
+        if _REDIRECT_MIN <= response.status < _REDIRECT_MAX:
+            # Never followed (see ``_RefuseRedirects``): replaying a credentialed
+            # request at a host the response names is a credential leak, and an
+            # https->http hop would send it in the clear. A redirect therefore
+            # means the configured endpoint is not the API - a non-retryable
+            # request failure, reported without naming the destination.
+            return _Attempt(self._failure(ProviderErrorCode.INVALID_REQUEST, started))
         if response.status != _HTTP_OK:
             code = _STATUS_CODES.get(response.status, ProviderErrorCode.UNKNOWN)
             return _Attempt(self._failure(code, started), _retry_after(response.headers))
@@ -472,13 +619,23 @@ class GroqProvider:
                 latency_ms,
                 model,
             )
-        reported = envelope.get("model")
+        reported = _response_model(envelope, fallback=model)
+        if reported is None:
+            # The response's own metadata cannot satisfy the contract's ``model``
+            # field. Constructing ParseSuccess would raise instead of reporting a
+            # failure, so the whole response is refused as sanitized content.
+            return self._content_failure(
+                "provider_metadata_invalid",
+                "provider response metadata is not usable",
+                latency_ms,
+                model,
+            )
         return ParseSuccess(
             data=data,
             strict_mode_used=False,
             usage=usage,
             latency_ms=latency_ms,
-            model=reported if isinstance(reported, str) and reported.strip() else model,
+            model=reported,
             raw="",
         )
 
@@ -540,7 +697,28 @@ class GroqProvider:
 
 def _elapsed_ms(started: float) -> int:
     """Whole milliseconds since ``started`` (never negative)."""
-    return max(0, int((time.monotonic() - started) * 1_000))
+    return max(0, int((_now() - started) * 1_000))
+
+
+def _response_model(envelope: Mapping[str, object], *, fallback: str) -> str | None:
+    """Return a contract-valid model identifier, or ``None`` if the metadata is bad.
+
+    An *absent* identifier falls back to the configured model: that is a provider
+    reporting habit, and the configured value is trusted. A *present* identifier
+    that cannot be the contract's ``model`` field - not a string, blank, or longer
+    than 120 characters - makes the response unusable, because building
+    :class:`~rfq_agent.contracts.llm.ParseSuccess` from it would raise a
+    validation error rather than report a failure.
+    """
+    if "model" not in envelope:
+        return fallback
+    value = envelope["model"]
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > _MAX_IDENTIFIER_CHARS:
+        return None
+    return text
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:

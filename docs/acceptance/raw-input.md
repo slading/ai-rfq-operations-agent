@@ -71,10 +71,38 @@ raw body ──▶ envelope ──▶ live provider (one call, bounded)
 
 The identifiers in the report (`RFQ_…`, `RUN_…`, `QTE_…`, `Q-<year>-<digits>`,
 `LI_…`) are derived from the sender, arrival instant, subject, channel and body
-digest. Re-running the same file derives the same identities and reports
-`DUPLICATE`, writing nothing new.
+digest, so re-running the same file derives the same identities. **Replay
+detection happens in the accepted engine, not before the model call** — the
+claims have to exist before the deterministic check runs — so a re-run is only
+`DUPLICATE` when it gets that far.
 
-One cost note, stated rather than glossed: a replay still makes **one** model
+What a re-run of an unchanged file actually reports, case by case:
+
+| Second run of the same delivery | What happens | Reported |
+| --- | --- | --- |
+| Identical, supported claims | the accepted engine finds the stored intake and quote and writes nothing new | `DUPLICATE` |
+| Provider timeout or failure | no claim is produced, so the engine is never reached | `PROVIDER_TIMEOUT` / `PROVIDER_FAILURE` refusal; nothing stored, nothing changed |
+| Output that is not valid JSON, is oversized, violates the schema, sets a system-owned field, or claims no lines | the claim is refused before the engine | `RESPONSE_*` / `NO_CLAIMED_LINES` refusal; nothing stored, nothing changed |
+| A schema-valid claim that differs from the first run (a different quantity, evidence span, delivery phrase, extra line or extra question) | the engine is reached with a *different* extraction, and verification refuses it against the stored source — the stored intake still matches, but the claim does not | `HUMAN_REQUIRED_BEFORE_QUOTE` (a claim/line refusal) — **not** `DUPLICATE` |
+| Stored history moved underneath the delivery (e.g. another worker advanced the run) | intake refuses to rejoin a run that is no longer the untouched attempt it wrote | `CONFLICT` (`STORED_STATE_CONFLICT`) |
+
+Every row was checked by running it, not inferred: against one seeded database,
+a first run reported `DRAFT_AWAITING_HUMAN_REVIEW`, an identical second run
+`DUPLICATE`, the failure variants `PROVIDER_TIMEOUT` / `RESPONSE_NOT_JSON` /
+`NO_CLAIMED_LINES`, each changed-claim variant `HUMAN_REQUIRED_BEFORE_QUOTE`, and
+`CONFLICT` appeared once the stored run was advanced between the two deliveries.
+
+One refusal happens before any of this: with live mode disabled or no credential
+the command exits `1` without calling a provider and without reading the body, so
+there is no report at all (and nothing is stored or changed).
+
+So `DUPLICATE` is the outcome for an *equivalent successful re-extraction*, not a
+guarantee for every re-run: extraction is a model call, and a failure or a
+changed claim is reported as what it is. In none of those cases is anything
+overwritten — intake history is append-only and a stored quote is never revised —
+so re-delivering the original file once the provider is healthy is always safe.
+
+One cost note, stated rather than glossed: a re-run still makes **one** model
 call, because the identity is derived from the delivery and the accepted check
 happens once the claim exists. Suppressing a re-delivery before the provider is
 called would need an intake-first design with its own accepted phase; this slice

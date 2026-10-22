@@ -341,9 +341,12 @@ The order is the contract:
    sender, arrival instant, subject and channel. The RFQ, run, quote, quote
    number, line identifiers and the pricing/stock/delivery instants are derived
    by trusted code from that metadata and the body digest (`derive_identifiers`
-   exposes the derivation). No clock is read, no identifier is random, and a
-   repeated delivery derives the same ones — which is why a replay is the
-   accepted `DUPLICATE`, not a second quote.
+   exposes the derivation). No clock is read, no identifier is random, and an
+   equivalent successful re-extraction derives the same ones — which is why such
+   a replay is the accepted `DUPLICATE`, not a second quote. It is not a promise
+   for every re-run: a provider/extraction failure is a refusal that stores
+   nothing, and a *changed* claim is refused by verification rather than treated
+   as a duplicate (see `docs/acceptance/raw-input.md`).
 2. **One bounded model call.** `rfq_agent.llm_extraction` frames the body in the
    accepted nonce-delimited untrusted envelope and sends it with a fixed system
    instruction block and the accepted `ExtractionResult` JSON schema (taken from
