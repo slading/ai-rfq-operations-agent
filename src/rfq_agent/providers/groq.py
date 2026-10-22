@@ -35,12 +35,13 @@ generated tokens, a maximum number of attempts, and a maximum response size in
 bytes - the reader stops one byte past the ceiling and refuses the body rather
 than buffering whatever the provider sends.
 
-**Redirects are never followed.** ``urllib`` replays a redirected request with
-the original headers minus only the content headers, which would forward the
-``Authorization`` header to whatever host the response names, and it permits an
-``https`` to ``http`` downgrade. The transport therefore installs a redirect
-handler that declines every 3xx, and a 3xx status is a non-retryable typed
-failure - no second request is ever made.
+**Redirects are never followed and never read.** A 3xx is decided from the
+status line and headers alone: the response object is closed immediately, its
+body is left unread, and ``Location`` is never parsed. A client that read the
+body first would block on the provider's schedule, and one that followed the
+redirect would forward ``Authorization`` to whatever host the response names -
+including an ``https`` to ``http`` downgrade. A 3xx status is a non-retryable
+typed failure, so no second request is ever made.
 
 **Structured output is validated locally, not trusted.** The adapter asks for
 JSON mode and validates the payload against the domain schema itself over
@@ -57,15 +58,18 @@ any message this module builds.
 from __future__ import annotations
 
 import http.client
+import io
 import json
+import os
 import secrets
+import select
 import socket
+import ssl
 import time
 import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import ValidationError
 
@@ -96,6 +100,7 @@ if TYPE_CHECKING:
         ParseRequest,
         ParseResult,
     )
+    from rfq_agent.domain.values import Json
 
 __all__ = [
     "GroqProvider",
@@ -141,9 +146,13 @@ _MAX_TIMEOUT_SECONDS = 300
 #: The only status that carries a usable body.
 _HTTP_OK = 200
 
-#: A redirect is never followed. See :class:`_RefuseRedirects`.
+#: A redirect is never followed and its body is never read.
 _REDIRECT_MIN = 300
 _REDIRECT_MAX = 400
+
+#: Smallest budget handed to a blocking socket call, so a nearly expired deadline
+#: is still a positive timeout rather than a non-blocking socket.
+_MIN_BUDGET_SECONDS = 0.001
 
 #: How much of a response body one underlying read may return. Small enough that
 #: the remaining wall-clock budget is re-checked often, large enough that a normal
@@ -179,8 +188,8 @@ class HttpResponse:
 class HttpTransport(Protocol):
     """The seam that performs one request.
 
-    The default implementation uses :mod:`urllib.request`; tests pass a
-    scripted callable. A transport raises ``TimeoutError`` for a timeout,
+    The default implementation uses :mod:`http.client`; tests pass a scripted
+    callable. A transport raises ``TimeoutError`` for a timeout,
     ``OSError``/``urllib.error.URLError`` for a network failure and
     ``http.client.HTTPException`` for a protocol failure - it never retries, and
     it never classifies. The default transport treats ``timeout_seconds`` as a
@@ -193,38 +202,97 @@ class HttpTransport(Protocol):
         ...
 
 
-class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
-    """A redirect handler that never redirects.
+class _DeadlineSocket:
+    """A socket proxy on which every read and write observes one deadline.
 
-    ``urllib`` follows 3xx by default, and its redirect request is built from the
-    original request's headers minus only ``Content-Length`` and ``Content-Type``:
-    the ``Authorization`` header - this adapter's provider credential - would be
-    replayed at whatever host the response named, and an ``https`` URL would be
-    allowed to become ``http``. Neither is acceptable for a call carrying a
-    secret, so ``redirect_request`` always declines. Declining (rather than
-    rewriting the URL) means no second transmission is attempted at all: the
-    opener falls back to ``http_error_default``, which raises
-    :class:`urllib.error.HTTPError` for the 3xx response, and the adapter turns
-    that status into a non-retryable typed failure.
+    This is the load-bearing piece of the wall-clock budget. A socket timeout is
+    *per operation*: a response that trickles one byte at a time never trips it,
+    however small it is. ``http.client`` also performs reads this module cannot
+    see - the status line, the response headers, chunk framing and the trailers
+    are all parsed inside library calls - so checking the clock between
+    application-level reads cannot interrupt them either.
+
+    Every one of those library reads ultimately calls ``recv_into`` (or
+    ``recv``) on the socket, so wrapping the socket is what makes the deadline
+    apply to *all* of them: before each call the remaining budget is recomputed
+    from the monotonic clock and armed as that call's own timeout. No single read
+    can wait past the deadline, and a trickle that keeps making progress still
+    stops at it. ``sendall`` is bounded the same way, and ``makefile`` hands back
+    a buffered reader whose underlying reads go through this proxy rather than
+    around it.
     """
 
-    def redirect_request(  # noqa: PLR0917 - urllib's signature, called positionally
-        self,
-        req: urllib.request.Request,
-        fp: object,
-        code: int,
-        msg: str,
-        headers: object,
-        newurl: str,
-    ) -> None:
-        """Never build a follow-up request, for any status, host or scheme."""
-        del req, fp, code, msg, headers, newurl
+    __slots__ = ("_deadline", "_sock")
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def recv(self, *args: object) -> bytes:
+        """Read at most one chunk, waiting no later than the deadline."""
+        self._sock.settimeout(_remaining(self._deadline))
+        return self._sock.recv(*args)  # type: ignore[arg-type]
+
+    def recv_into(self, *args: object) -> int:
+        """Read into a buffer, waiting no later than the deadline."""
+        self._sock.settimeout(_remaining(self._deadline))
+        return self._sock.recv_into(*args)  # type: ignore[arg-type]
+
+    def sendall(self, *args: object) -> None:
+        """Write the request, waiting no later than the deadline."""
+        self._sock.settimeout(_remaining(self._deadline))
+        self._sock.sendall(*args)  # type: ignore[arg-type]
+
+    def makefile(self, mode: str = "rb", *args: object, **kwargs: object) -> io.BufferedReader:
+        """Return a buffered reader that reads *through* this proxy.
+
+        ``socket.socket.makefile`` would bind the underlying socket, which is
+        exactly the bypass this class exists to close. The descriptor is
+        duplicated instead, for the reason :class:`_DeadlineStream` documents.
+        """
+        del args, kwargs
+        if "r" not in mode:
+            msg = "the provider transport only reads through a buffered file"
+            raise ValueError(msg)
+        duplicate = socket.socket(fileno=os.dup(self._sock.fileno()))
+        return io.BufferedReader(_DeadlineStream(duplicate, self._deadline))
+
+    def __getattr__(self, name: str) -> object:
+        """Delegate everything else (``close``, ``fileno``, ``shutdown``) unchanged."""
+        return getattr(self._sock, name)
 
 
-#: The one opener this adapter uses. ``build_opener`` substitutes this handler for
-#: its own default redirect handler (same class hierarchy), so no other code path
-#: can re-enable redirect following for provider traffic.
-_OPENER = urllib.request.build_opener(_RefuseRedirects())
+class _DeadlineStream(io.RawIOBase):
+    """An unbuffered reader over a duplicated descriptor, closed with the stream.
+
+    ``http.client`` closes the connection as soon as the response headers say the
+    connection will not persist - *before* the body has been read. The stdlib
+    survives that because ``socket.makefile`` duplicates the descriptor, so the
+    buffered reader outlives the socket. This proxy has to make the same
+    duplicate, and close it here; otherwise the body read fails with ``EBADF``.
+    """
+
+    __slots__ = ("_deadline", "_sock")
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._deadline = deadline
+
+    def readable(self) -> bool:
+        """This stream only ever reads a response."""
+        return True
+
+    def readinto(self, buffer: object) -> int:
+        """Read into ``buffer``, waiting no later than the deadline."""
+        self._sock.settimeout(_remaining(self._deadline))
+        return self._sock.recv_into(buffer)  # type: ignore[arg-type]
+
+    def close(self) -> None:
+        """Close the duplicated descriptor with the stream."""
+        if not self.closed:
+            self._sock.close()
+            super().close()
 
 
 def _now() -> float:
@@ -232,70 +300,146 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _urllib_transport(request: HttpRequest) -> HttpResponse:
-    """Perform one HTTPS request under one wall-clock deadline.
+def _remaining(deadline: float) -> float:
+    """Return the budget left, or raise the deadline ``TimeoutError``."""
+    remaining = deadline - _now()
+    if remaining <= 0:
+        msg = "the provider request exceeded its wall-clock deadline"
+        raise TimeoutError(msg)
+    return remaining
 
-    The budget is a *monotonic deadline*, not a per-socket-operation timeout: it
-    is fixed before connecting, the connect and header read are bounded by it,
-    and the body is read in chunks with the remaining budget re-checked and
-    re-armed before every chunk. A response that trickles one byte at a time
-    therefore cannot outlive the deadline - the reader notices between chunks
-    and raises :class:`TimeoutError`, which the adapter reports as ``TIMEOUT``.
 
-    Redirects are never followed (:class:`_RefuseRedirects`), and the body is read
-    at most one byte past the configured ceiling so an oversized response is
-    detectable without being buffered whole.
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection whose socket enforces the attempt's deadline."""
+
+    def __init__(self, host: str, port: int, deadline: float) -> None:
+        super().__init__(host, port, timeout=max(deadline - _now(), _MIN_BUDGET_SECONDS))
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        """Connect inside the budget, then install the deadline proxy."""
+        self.timeout = _remaining(self._deadline)
+        super().connect()
+        self.sock = _DeadlineSocket(self.sock, self._deadline)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPS connection whose connect, handshake and socket share one deadline.
+
+    The TLS handshake is driven explicitly against a non-blocking socket with a
+    ``select`` wait bounded by the remaining budget. A blocking handshake would
+    honour only a per-read timeout, so a trickling peer could exceed the deadline.
+    """
+
+    def __init__(self, host: str, port: int, deadline: float) -> None:
+        super().__init__(host, port, timeout=max(deadline - _now(), _MIN_BUDGET_SECONDS))
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        """Connect, complete the handshake inside the budget, then proxy."""
+        sock = socket.create_connection(
+            (self.host, self.port), _remaining(self._deadline), self.source_address
+        )
+        try:
+            wrapped = self._context.wrap_socket(
+                sock, server_hostname=self.host, do_handshake_on_connect=False
+            )
+            _complete_handshake(wrapped, self._deadline)
+            wrapped.settimeout(_remaining(self._deadline))
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = _DeadlineSocket(wrapped, self._deadline)
+
+
+def _complete_handshake(sock: ssl.SSLSocket, deadline: float) -> None:
+    """Drive a TLS handshake, never waiting past the remaining budget."""
+    sock.setblocking(False)
+    while True:
+        try:
+            sock.do_handshake()
+            return
+        except ssl.SSLWantReadError:
+            _await_ready(sock, deadline, writing=False)
+        except ssl.SSLWantWriteError:
+            _await_ready(sock, deadline, writing=True)
+
+
+def _await_ready(sock: ssl.SSLSocket, deadline: float, *, writing: bool) -> None:
+    """Wait for the socket to become ready, or raise the deadline timeout."""
+    remaining = _remaining(deadline)
+    if writing:
+        ready = select.select([], [sock], [], remaining)[1]
+    else:
+        ready = select.select([sock], [], [], remaining)[0]
+    if not ready:
+        msg = "the provider TLS handshake exceeded the request deadline"
+        raise TimeoutError(msg)
+
+
+def _connect(parts: SplitResult, deadline: float) -> http.client.HTTPConnection:
+    """Open a connection for ``parts`` bounded by this attempt's deadline."""
+    secure = parts.scheme == "https"
+    host = parts.hostname or ""
+    port = parts.port or (443 if secure else 80)
+    if secure:
+        return _DeadlineHTTPSConnection(host, port, deadline)
+    return _DeadlineHTTPConnection(host, port, deadline)
+
+
+def _http_transport(request: HttpRequest) -> HttpResponse:
+    """Perform one HTTP(S) request under one enforced wall-clock deadline.
+
+    The budget is fixed before connecting and applies to every phase:
+    ``connect`` (TCP and the TLS handshake), the request write, the status line,
+    the response headers, chunk framing, the body and the trailers - all of them
+    read or write through :class:`_DeadlineSocket`, which re-arms the remaining
+    budget on the socket before each underlying operation.
+
+    No redirect is followed and no redirect body is read: a 3xx is returned to
+    the caller as a status with an empty body, so a stalled redirect cannot
+    consume the budget, and a ``Location`` is never contacted. A 2xx body is read
+    at most one byte past the configured ceiling.
     """
     deadline = _now() + request.timeout_seconds
-    http_request = urllib.request.Request(  # noqa: S310 - scheme enforced by GroqProvider
-        request.url,
-        data=request.body,
-        headers=dict(request.headers),
-        method="POST",
-    )
+    parts = urlsplit(request.url)
+    target = parts.path or "/"
+    if parts.query:
+        target = f"{target}?{parts.query}"
+    connection = _connect(parts, deadline)
     try:
-        with _OPENER.open(http_request, timeout=request.timeout_seconds) as response:
-            body = _read_bounded(response, request.max_response_bytes, deadline)
-            return HttpResponse(
-                status=int(response.status),
-                body=body,
-                headers=dict(response.headers.items()),
-            )
-    except urllib.error.HTTPError as error:
-        # A 4xx/5xx - and any 3xx, which is deliberately never followed - is a
-        # provider answer, not a transport failure: hand its status to the
-        # classifier. The body is read bounded and never parsed.
+        connection.request("POST", target, body=request.body, headers=dict(request.headers))
+        response = connection.getresponse()
+        status = int(response.status)
+        headers = dict(response.getheaders())
+        if _REDIRECT_MIN <= status < _REDIRECT_MAX:
+            # The caller classifies it. Closing without reading keeps a stalled
+            # redirect body from becoming a timeout - and therefore a retry.
+            response.close()
+            return HttpResponse(status=status, body=b"", headers=headers)
         try:
-            body = _read_bounded(error, request.max_response_bytes, deadline)
+            body = _read_bounded(response, request.max_response_bytes, deadline)
         finally:
-            error.close()
-        return HttpResponse(
-            status=int(error.code),
-            body=body,
-            headers=dict(error.headers.items()) if error.headers is not None else {},
-        )
+            response.close()
+        return HttpResponse(status=status, body=body, headers=headers)
+    finally:
+        connection.close()
 
 
 def _read_bounded(response: object, max_bytes: int, deadline: float) -> bytes:
     """Read a body up to ``max_bytes + 1`` bytes, or raise ``TimeoutError``.
 
-    Before every chunk the remaining budget is recomputed from the monotonic
-    clock and armed on the response's socket, so the *next* underlying read can
-    never wait past the deadline, and total time is bounded by the deadline plus
-    at most one short read. ``read1`` is used where available because it performs
-    at most one underlying read; a plain ``read`` (all that an
-    :class:`urllib.error.HTTPError` offers) is still bounded by the same budget.
+    The socket proxy already bounds every underlying read; this loop bounds the
+    *total* bytes and re-checks the clock between chunks, so an opaque response
+    object handed to the adapter is bounded too. ``read1`` is used where
+    available because it performs at most one underlying read.
     """
     read = getattr(response, "read1", None) or response.read  # type: ignore[attr-defined]
     chunks: list[bytes] = []
     budget = max_bytes + 1
     reached_eof = False
     while budget > 0:
-        remaining = deadline - _now()
-        if remaining <= 0:
-            msg = "the provider request exceeded its wall-clock deadline"
-            raise TimeoutError(msg)
-        _arm_read_timeout(response, remaining)
+        _remaining(deadline)
         chunk = read(min(_READ_CHUNK_BYTES, budget))
         if not chunk:
             reached_eof = True
@@ -321,21 +465,6 @@ def _require_complete_body(response: object, body: bytes) -> None:
     remaining = getattr(response, "length", None)
     if isinstance(remaining, int) and remaining > 0:
         raise http.client.IncompleteRead(body, remaining)
-
-
-def _arm_read_timeout(response: object, remaining: float) -> None:
-    """Bound the response socket's next read by the remaining budget.
-
-    The socket is reached through the documented ``fp.raw._sock`` shape of
-    :class:`http.client.HTTPResponse`. When it cannot be found - an opaque
-    response object - the deadline is still enforced between chunks, and the
-    socket keeps the timeout it was opened with.
-    """
-    fp = getattr(response, "fp", None)
-    raw = getattr(fp, "raw", None)
-    sock = getattr(raw, "_sock", None)
-    if isinstance(sock, socket.socket):
-        sock.settimeout(remaining)
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,7 +496,7 @@ class GroqProvider:
         base_delay_seconds: First backoff delay.
         max_delay_seconds: Backoff ceiling, and the cap on ``Retry-After``.
         jitter_ratio: Fraction of the delay added as jitter, in ``[0, 1]``.
-        transport: The HTTP seam; defaults to :func:`_urllib_transport`.
+        transport: The HTTP seam; defaults to :func:`_http_transport`.
         sleep: Injected so retry timing is testable; defaults to ``time.sleep``.
 
     Raises:
@@ -431,7 +560,7 @@ class GroqProvider:
         self._base_delay_seconds = base_delay_seconds
         self._max_delay_seconds = max_delay_seconds
         self._jitter_ratio = jitter_ratio
-        self._transport: HttpTransport = transport or _urllib_transport
+        self._transport: HttpTransport = transport or _http_transport
         self._sleep = sleep
 
     @property
@@ -561,11 +690,12 @@ class GroqProvider:
             return _Attempt(self._failure(ProviderErrorCode.SERVER_ERROR, started))
 
         if _REDIRECT_MIN <= response.status < _REDIRECT_MAX:
-            # Never followed (see ``_RefuseRedirects``): replaying a credentialed
-            # request at a host the response names is a credential leak, and an
-            # https->http hop would send it in the clear. A redirect therefore
-            # means the configured endpoint is not the API - a non-retryable
-            # request failure, reported without naming the destination.
+            # The transport never follows a redirect and never reads its body,
+            # so this is the first and only decision about it. Replaying a
+            # credentialed request at a host the response names would be a
+            # credential leak, and an https->http hop would send it in the clear.
+            # A redirect therefore means the configured endpoint is not the API:
+            # a non-retryable failure, reported without naming the destination.
             return _Attempt(self._failure(ProviderErrorCode.INVALID_REQUEST, started))
         if response.status != _HTTP_OK:
             code = _STATUS_CODES.get(response.status, ProviderErrorCode.UNKNOWN)
@@ -619,25 +749,25 @@ class GroqProvider:
                 latency_ms,
                 model,
             )
-        reported = _response_model(envelope, fallback=model)
-        if reported is None:
-            # The response's own metadata cannot satisfy the contract's ``model``
-            # field. Constructing ParseSuccess would raise instead of reporting a
-            # failure, so the whole response is refused as sanitized content.
+        if not _metadata_is_usable(envelope):
             return self._content_failure(
                 "provider_metadata_invalid",
                 "provider response metadata is not usable",
                 latency_ms,
                 model,
             )
-        return ParseSuccess(
-            data=data,
-            strict_mode_used=False,
-            usage=usage,
-            latency_ms=latency_ms,
-            model=reported,
-            raw="",
-        )
+        success = _validated_success(data=data, usage=usage, latency_ms=latency_ms, model=model)
+        if success is None:
+            # The response's own metadata cannot satisfy the contract's ``model``
+            # field, so building ParseSuccess would raise instead of reporting a
+            # failure. The whole response is refused as sanitized content.
+            return self._content_failure(
+                "provider_metadata_invalid",
+                "provider response metadata is not usable",
+                latency_ms,
+                model,
+            )
+        return success
 
     def _bind(
         self, result: ParseSuccess, model: type[PydanticModel]
@@ -658,7 +788,9 @@ class GroqProvider:
                 issues=(_schema_issue(error),),
                 usage=result.usage,
                 latency_ms=result.latency_ms,
-                model=result.model,
+                # The configured identifier, never ``result.model``: a failure is
+                # a place a provider-controlled string must not reach.
+                model=self._model,
             )
 
     def _failure(self, code: ProviderErrorCode, started: float) -> ParseFailure:
@@ -700,25 +832,55 @@ def _elapsed_ms(started: float) -> int:
     return max(0, int((_now() - started) * 1_000))
 
 
-def _response_model(envelope: Mapping[str, object], *, fallback: str) -> str | None:
-    """Return a contract-valid model identifier, or ``None`` if the metadata is bad.
+def _validated_success(
+    *, data: dict[str, Json], usage: TokenUsage, latency_ms: int, model: str
+) -> ParseSuccess | None:
+    """Build the success object, or ``None`` when its metadata is unusable.
 
-    An *absent* identifier falls back to the configured model: that is a provider
-    reporting habit, and the configured value is trusted. A *present* identifier
-    that cannot be the contract's ``model`` field - not a string, blank, or longer
-    than 120 characters - makes the response unusable, because building
-    :class:`~rfq_agent.contracts.llm.ParseSuccess` from it would raise a
-    validation error rather than report a failure.
+    The object is validated against the *actual* downstream contract by
+    constructing it: the contract's own constraints (``model`` a 1-120 character
+    string, a coherent token total) decide, so this cannot drift from what the
+    rest of the system accepts. Provider-controlled text is never carried into
+    it - ``model`` is the configured identifier, and the vendor's own report is
+    only checked for usability - so neither a success nor a later failure can
+    echo a string the provider chose.
+    """
+    try:
+        return ParseSuccess(
+            data=data,
+            strict_mode_used=False,
+            usage=usage,
+            latency_ms=latency_ms,
+            model=model,
+            raw="",
+        )
+    except ValidationError:
+        return None
+
+
+def _metadata_is_usable(envelope: Mapping[str, object]) -> bool:
+    """Whether the response's own model metadata can be believed at all.
+
+    An *absent* identifier is a provider reporting habit and is ignored. A
+    *present* one must satisfy every constraint of the bytes it will travel as:
+    a string, non-blank after stripping, within the contract's length bound,
+    encodable as UTF-8 and printable. The last two are what reject a lone
+    surrogate such as U+D800: the schema accepts it in a ``str`` field, so only an
+    encoding check catches it before it reaches a serialiser.
     """
     if "model" not in envelope:
-        return fallback
+        return True
     value = envelope["model"]
     if not isinstance(value, str):
-        return None
+        return False
     text = value.strip()
     if not text or len(text) > _MAX_IDENTIFIER_CHARS:
-        return None
-    return text
+        return False
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return text.isprintable()
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:
