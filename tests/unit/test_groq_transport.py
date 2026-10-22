@@ -24,6 +24,7 @@ import http.client
 import json
 import socket
 import ssl
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -140,15 +141,41 @@ class _Trickle(_QuietHandler):
 
 
 class _Truncated(_QuietHandler):
-    """Promise 100 bytes, send five and hang up."""
+    """Promise 100 bytes, send five and hang up cleanly.
+
+    The request body is drained first. It was not, and that was the intermittent
+    failure this fixture used to cause: closing a socket with unread data in its
+    receive buffer makes some kernels send RST where others send FIN, so the same
+    test sometimes saw ``IncompleteRead`` and sometimes ``ConnectionResetError``.
+    Both are legitimate client-visible outcomes of a truncated response; the
+    ``FIN`` case is pinned here deterministically, and the abortive case is
+    pinned separately in :class:`_Aborted`.
+    """
 
     def handle_request(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", "100")
         self.end_headers()
         self.wfile.write(b'{"a":')
         self.wfile.flush()
+        self.close_connection = True
+
+
+class _Aborted(_QuietHandler):
+    """Promise 100 bytes, send five, then reset the connection instead of closing it."""
+
+    def handle_request(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b'{"a":')
+        self.wfile.flush()
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        self.connection.close()
         self.close_connection = True
 
 
@@ -630,8 +657,31 @@ def test_a_stalled_tls_handshake_is_bounded_by_the_deadline() -> None:
 
 
 def test_a_truncated_http_response_raises_a_protocol_error() -> None:
-    with _serve(_Truncated) as server, pytest.raises(http.client.IncompleteRead):
+    """A response shorter than its ``Content-Length`` is never returned as a body."""
+    with _serve(_Truncated) as server, pytest.raises(http.client.IncompleteRead) as raised:
         _http_transport(_http_request(_url(server), timeout_seconds=2.0))
+
+    assert raised.value.partial == b'{"a":'
+    assert raised.value.expected == 95
+
+
+def test_an_abortively_closed_response_is_a_typed_retryable_failure() -> None:
+    """The other half of the same event: RST instead of FIN.
+
+    A peer that resets mid-body is a transport failure, not a short answer, and it
+    must not be mistaken for a truncated-but-acceptable body. Which of the two a
+    truncated response produces depends on the peer's teardown, so both are pinned
+    - and both end in the same typed, retryable classification.
+    """
+    with _serve(_Aborted) as server:
+        transport = _RecordingTransport(_http_transport, origin=_url(server, ""))
+        result, instance = _provider(transport, max_attempts=1).parse(_request(), TinyPayload)
+
+    assert instance is None
+    assert isinstance(result, ParseFailure)
+    assert result.provider_error == ProviderErrorCode.SERVER_ERROR.value
+    assert result.retryable is True
+    assert '{"a":' not in f"{result!r} {result.model_dump_json()}"
 
 
 def test_an_incomplete_read_from_a_transport_is_a_typed_retryable_failure() -> None:

@@ -440,6 +440,15 @@ the real model (one small completion, never in CI).
   are refused, not buffered) and `RFQ_GROQ__RETRY__MAX_ATTEMPTS` with capped,
   jittered backoff. Only the accepted retryable codes are retried; bad output
   never is.
+* **The transport speaks TLS and verifies the endpoint.** Responses are read
+  through the `ssl.SSLSocket` the handshake produced — never from the descriptor
+  directly — with the system trust store, certificate and hostname verification.
+  An endpoint that cannot prove its identity is a non-retryable refusal, and the
+  request is never written. The one phase the wall-clock deadline cannot
+  interrupt is name resolution: `getaddrinfo` is a blocking libc call, so a slow
+  resolver can overrun the budget (every stdlib client shares this). The deadline
+  is re-checked the moment the connection is established, so an overrun surfaces
+  as `TIMEOUT` instead of being spent on the request.
 * **Live calls need two switches.** `RFQ_LLM_MODE=live` *and* a credential.
   Default configuration (`llm_mode=replay`) can never reach the network, so the
   whole offline suite — including every acceptance test — runs against the

@@ -26,14 +26,30 @@ within that cap. Bad output is never retried here - a repair is a pipeline
 policy, and this slice has none. Exhausting the attempts is a reported failure,
 never a best-effort guess.
 
-**Every call is bounded, in wall-clock terms.** Each attempt gets one monotonic
-deadline: the connect and header read are bounded by it, and the body is read in
-chunks with the remaining budget re-checked and re-armed on the response socket
-before each chunk, so a response that trickles one byte at a time still times out
-instead of running indefinitely. Alongside the deadline there is a ceiling on
-generated tokens, a maximum number of attempts, and a maximum response size in
-bytes - the reader stops one byte past the ceiling and refuses the body rather
-than buffering whatever the provider sends.
+**Every call is bounded, in wall-clock terms - with one honest exception.** Each
+attempt gets one monotonic deadline, fixed before connecting. The TCP connect,
+the TLS handshake (driven non-blocking under ``select``, so a peer that trickles
+the handshake cannot outlast it), the request write, the status line, the
+response headers, chunk framing, the body and the trailers all run under it: the
+socket is wrapped so the remaining budget is re-armed before every read and write,
+which is the one point every one of those phases passes through. Alongside the
+deadline there is a ceiling on generated tokens, a maximum number of attempts,
+and a maximum response size in bytes - the reader stops one byte past the ceiling
+and refuses the body rather than buffering whatever the provider sends.
+
+The exception is name resolution. ``socket.getaddrinfo`` is a blocking libc call
+that no socket timeout, ``select`` or Python-level deadline can interrupt, so a
+slow resolver can overrun the budget; every stdlib HTTP client shares this. The
+deadline is re-checked as soon as the connection is established, so an overrun is
+reported as ``TIMEOUT`` instead of being spent silently on the TLS handshake and
+the request. No other phase is unbounded.
+
+**TLS is never stepped around.** Every byte of the response is read through the
+:class:`ssl.SSLSocket` the handshake produced, through the buffered reader
+``http.client`` parses status lines, headers and bodies with. The transport never
+reads the descriptor directly and never substitutes a plain socket for the TLS
+one, so decryption, certificate verification and hostname checking apply to the
+same bytes that are parsed.
 
 **Redirects are never followed and never read.** A 3xx is decided from the
 status line and headers alone: the response object is closed immediately, its
@@ -60,7 +76,6 @@ from __future__ import annotations
 import http.client
 import io
 import json
-import os
 import secrets
 import select
 import socket
@@ -219,7 +234,8 @@ class _DeadlineSocket:
     can wait past the deadline, and a trickle that keeps making progress still
     stops at it. ``sendall`` is bounded the same way, and ``makefile`` hands back
     a buffered reader whose underlying reads go through this proxy rather than
-    around it.
+    around it - and therefore through the TLS object beneath it, never around
+    that.
     """
 
     __slots__ = ("_deadline", "_sock")
@@ -246,53 +262,31 @@ class _DeadlineSocket:
     def makefile(self, mode: str = "rb", *args: object, **kwargs: object) -> io.BufferedReader:
         """Return a buffered reader that reads *through* this proxy.
 
-        ``socket.socket.makefile`` would bind the underlying socket, which is
-        exactly the bypass this class exists to close. The descriptor is
-        duplicated instead, for the reason :class:`_DeadlineStream` documents.
+        The reader is :class:`socket.SocketIO` over this proxy, which is exactly
+        how ``socket.socket.makefile`` builds one over a socket: every read lands
+        in :meth:`recv_into` and is therefore given the remaining budget. What it
+        must *not* be is a second plain socket over the same descriptor - that
+        would read raw TLS records and hand back ciphertext (see the module
+        docstring), so the decryption, and with it the certificate and hostname
+        verification already performed by the handshake, would be bypassed.
+
+        The reference count is the stdlib's, for the stdlib's reason:
+        ``http.client`` closes the connection as soon as the response headers say
+        the connection will not persist, *before* the body has been read. Counting
+        the reader keeps the descriptor alive until the reader itself closes.
         """
         del args, kwargs
         if "r" not in mode:
             msg = "the provider transport only reads through a buffered file"
             raise ValueError(msg)
-        duplicate = socket.socket(fileno=os.dup(self._sock.fileno()))
-        return io.BufferedReader(_DeadlineStream(duplicate, self._deadline))
+        # ``_io_refs`` is the documented-by-source counter ``socket.makefile``
+        # uses for exactly this purpose; there is no public equivalent.
+        self._sock._io_refs += 1  # noqa: SLF001
+        return io.BufferedReader(socket.SocketIO(self, "rb"))  # type: ignore[arg-type]
 
     def __getattr__(self, name: str) -> object:
         """Delegate everything else (``close``, ``fileno``, ``shutdown``) unchanged."""
         return getattr(self._sock, name)
-
-
-class _DeadlineStream(io.RawIOBase):
-    """An unbuffered reader over a duplicated descriptor, closed with the stream.
-
-    ``http.client`` closes the connection as soon as the response headers say the
-    connection will not persist - *before* the body has been read. The stdlib
-    survives that because ``socket.makefile`` duplicates the descriptor, so the
-    buffered reader outlives the socket. This proxy has to make the same
-    duplicate, and close it here; otherwise the body read fails with ``EBADF``.
-    """
-
-    __slots__ = ("_deadline", "_sock")
-
-    def __init__(self, sock: socket.socket, deadline: float) -> None:
-        super().__init__()
-        self._sock = sock
-        self._deadline = deadline
-
-    def readable(self) -> bool:
-        """This stream only ever reads a response."""
-        return True
-
-    def readinto(self, buffer: object) -> int:
-        """Read into ``buffer``, waiting no later than the deadline."""
-        self._sock.settimeout(_remaining(self._deadline))
-        return self._sock.recv_into(buffer)  # type: ignore[arg-type]
-
-    def close(self) -> None:
-        """Close the duplicated descriptor with the stream."""
-        if not self.closed:
-            self._sock.close()
-            super().close()
 
 
 def _now() -> float:
@@ -323,33 +317,77 @@ class _DeadlineHTTPConnection(http.client.HTTPConnection):
         self.sock = _DeadlineSocket(self.sock, self._deadline)
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """The context used for provider traffic: verification on, as the stdlib has it.
+
+    ``ssl.create_default_context`` is the hardened default - ``CERT_REQUIRED``
+    against the system trust store, and hostname checking, which ``SSLContext``
+    applies to the ``server_hostname`` passed to ``wrap_socket``. The ALPN and
+    post-handshake-auth settings repeat what ``http.client`` would have applied to
+    its own default context. Indirected through this function so the suite can
+    trust a loopback fixture CA without touching global SSL state; production
+    always gets the verifying default.
+    """
+    context = ssl.create_default_context()
+    context.set_alpn_protocols(["http/1.1"])
+    if context.post_handshake_auth is not None:
+        context.post_handshake_auth = True
+    return context
+
+
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
     """An HTTPS connection whose connect, handshake and socket share one deadline.
 
     The TLS handshake is driven explicitly against a non-blocking socket with a
     ``select`` wait bounded by the remaining budget. A blocking handshake would
     honour only a per-read timeout, so a trickling peer could exceed the deadline.
+
+    The handshake also *is* the security boundary: certificate verification and
+    hostname checking happen here, under the deadline, and every later read goes
+    through the resulting :class:`ssl.SSLSocket`. Nothing in this module ever
+    reads the underlying descriptor directly.
     """
 
     def __init__(self, host: str, port: int, deadline: float) -> None:
-        super().__init__(host, port, timeout=max(deadline - _now(), _MIN_BUDGET_SECONDS))
+        super().__init__(
+            host,
+            port,
+            timeout=max(deadline - _now(), _MIN_BUDGET_SECONDS),
+            context=_ssl_context(),
+        )
         self._deadline = deadline
 
     def connect(self) -> None:
-        """Connect, complete the handshake inside the budget, then proxy."""
-        sock = socket.create_connection(
+        """Connect, complete the handshake inside the budget, then proxy.
+
+        Cleanup follows ownership, not construction order: ``wrap_socket`` detaches
+        the raw socket and returns an :class:`ssl.SSLSocket` that now owns the
+        descriptor, so a failed handshake must close *that* object. Closing the
+        detached raw socket instead - as this did before - silently leaked the
+        TLS socket and its descriptor for as long as the exception traceback that
+        referenced it survived.
+        """
+        raw = socket.create_connection(
             (self.host, self.port), _remaining(self._deadline), self.source_address
         )
         try:
-            wrapped = self._context.wrap_socket(
-                sock, server_hostname=self.host, do_handshake_on_connect=False
+            tls = self._context.wrap_socket(
+                raw, server_hostname=self.host, do_handshake_on_connect=False
             )
-            _complete_handshake(wrapped, self._deadline)
-            wrapped.settimeout(_remaining(self._deadline))
         except BaseException:
-            sock.close()
+            raw.close()
             raise
-        self.sock = _DeadlineSocket(wrapped, self._deadline)
+        try:
+            # DNS has already happened inside ``create_connection``; re-checking
+            # here is the only point at which an unresolvable overrun, or a
+            # multi-address connect, can be noticed. See the module docstring.
+            _remaining(self._deadline)
+            _complete_handshake(tls, self._deadline)
+            tls.settimeout(_remaining(self._deadline))
+        except BaseException:
+            tls.close()
+            raise
+        self.sock = _DeadlineSocket(tls, self._deadline)
 
 
 def _complete_handshake(sock: ssl.SSLSocket, deadline: float) -> None:
@@ -673,6 +711,12 @@ class GroqProvider:
             response = self._transport(request)
         except TimeoutError:
             return _Attempt(self._failure(ProviderErrorCode.TIMEOUT, started))
+        except ssl.SSLCertVerificationError:
+            # The endpoint could not prove it is the configured provider: the
+            # certificate is not trusted, or it is issued for another host. TLS
+            # refused before anything was sent, and no retry can change that, so
+            # this is not a transient server error.
+            return _Attempt(self._failure(ProviderErrorCode.INVALID_REQUEST, started))
         except urllib.error.URLError as error:
             code = (
                 ProviderErrorCode.TIMEOUT
