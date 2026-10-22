@@ -46,6 +46,10 @@ MODULES = [
     "rfq_agent.domain.values",
     "rfq_agent.domain.workflow",
     "rfq_agent.intake",
+    "rfq_agent.llm_extraction",
+    "rfq_agent.providers",
+    "rfq_agent.providers.groq",
+    "rfq_agent.raw_acceptance",
     "rfq_agent.workflow",
     "rfq_agent.workflow.transitions",
     "rfq_agent.observability",
@@ -120,15 +124,17 @@ def test_no_layer_without_a_phase_exists_yet() -> None:
     database, a provider client or a UI before the phase that owns them. The
     list shrinks as those phases are authorised and accepted -
     ``repositories.py`` left it in Phase 1C, when the read boundary was exactly
-    the authorised work - and what remains is what still has no phase behind it:
-    a provider client, a UI, and the workflow/tool layers.
+    the authorised work, and ``providers/groq.py`` left it in Project 04, when
+    the live extraction slice was exactly the authorised work - and what remains
+    is what still has no phase behind it: a UI and the tool layers.
     """
     root = pathlib.Path(rfq_agent.__path__[0])
     tree = {path.relative_to(root).as_posix() for path in root.rglob("*")}
-    forbidden = ("db/", "groq", "ui/", "workflow_engine", "tools/")
+    forbidden = ("db/", "ui/", "workflow_engine", "tools/")
     present = [entry for entry in tree if any(bad in entry for bad in forbidden)]
     assert present == [], f"No phase owns these yet: {present}"
 
-    # The one module that exists under a name this check used to forbid, so its
+    # Modules that exist under a name this check used to forbid, so their
     # presence is asserted rather than merely tolerated.
     assert "persistence/repositories.py" in tree
+    assert "providers/groq.py" in tree

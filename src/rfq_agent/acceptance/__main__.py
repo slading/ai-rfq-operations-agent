@@ -49,7 +49,7 @@ from rfq_agent.seed import DATASET_NAME, SEED_VERSION
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-__all__ = ["main"]
+__all__ = ["exit_code", "format_report", "main"]
 
 #: Label column width for the report layout (``"customer  : "``).
 _LABEL = 10
@@ -125,7 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("database: configured database")
         print("input: declaration file")
         print()
-        print(_format_report(report))
+        print(format_report(report))
     except Exception as error:  # noqa: BLE001 - outer boundary sanitizes all failures
         failure = error
     finally:
@@ -141,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if report is None:  # pragma: no cover - only reachable if the block above changed
         print("error: acceptance produced no report", file=sys.stderr)
         return 1
-    return _exit_code(report.outcome)
+    return exit_code(report.outcome)
 
 
 def _load_declaration(path: str) -> FreshRfq:
@@ -156,7 +156,7 @@ def _load_declaration(path: str) -> FreshRfq:
     return FreshRfq.model_validate(json.loads(text))
 
 
-def _exit_code(outcome: AcceptanceOutcome) -> int:
+def exit_code(outcome: AcceptanceOutcome) -> int:
     """Map an outcome onto the documented exit code."""
     if outcome in _PERSISTED_OUTCOMES:
         return 0
@@ -204,7 +204,7 @@ def _report_failure(failure: Exception) -> int:
     return 1
 
 
-def _format_report(report: AcceptanceReport) -> str:
+def format_report(report: AcceptanceReport) -> str:
     """Render one acceptance report as the block the operator reads."""
     rows = [f"=== fresh RFQ {report.rfq_id}"]
     intake = "rows written" if report.created else "rows already stored, unchanged"

@@ -322,6 +322,153 @@ model, no provider and no parser behind it; a pre-quote refusal is returned but
 and discarded; and a second, *different* quotation for a run that already has one
 is refused as a `CONFLICT` rather than becoming revision 2.
 
+## Real LLM extraction (Project 04 vertical slice)
+
+```bash
+# .env: RFQ_LLM_MODE=live and RFQ_GROQ__API_KEY=<key> (environment only)
+make migrate && make seed
+python -m rfq_agent.raw_acceptance --input docs/acceptance/raw-case-a.json
+```
+
+This is the first path that turns a **raw RFQ text body** into a persisted
+quotation. It is a composition of accepted pieces, not a new engine: one live
+model call produces the accepted extraction claims, and every decision after
+that belongs to the deterministic pipeline that already existed.
+
+The order is the contract:
+
+1. **Trusted metadata in.** The delivery file states the body verbatim plus the
+   sender, arrival instant, subject and channel. The RFQ, run, quote, quote
+   number, line identifiers and the pricing/stock/delivery instants are derived
+   by trusted code from that metadata and the body digest (`derive_identifiers`
+   exposes the derivation). No clock is read, no identifier is random, and an
+   equivalent successful re-extraction derives the same ones — which is why such
+   a replay is the accepted `DUPLICATE`, not a second quote. It is not a promise
+   for every re-run: a provider/extraction failure is a refusal that stores
+   nothing, and a *changed* claim is refused by verification rather than treated
+   as a duplicate (see `docs/acceptance/raw-input.md`).
+2. **One bounded model call.** `rfq_agent.llm_extraction` frames the body in the
+   accepted nonce-delimited untrusted envelope and sends it with a fixed system
+   instruction block and the accepted `ExtractionResult` JSON schema (taken from
+   the domain contract, never restated by hand). The sender, subject,
+   identifiers, catalogue, prices, stock, policy and clock are **not** sent.
+3. **The answer is hostile until proven otherwise.** It is parsed as JSON,
+   validated against the accepted schema (`extra="forbid"`, frozen, the
+   null-quantity and delivery contracts), and refused outright if it tries to set
+   `status` or `rejection_reason`. Prose, Markdown fences, invalid JSON, an
+   oversized body, a schema violation or an empty extraction are typed refusals —
+   no repair, no retry, and *nothing is written*: no intake row, no run, no quote.
+4. **The accepted engine decides.** `accept_rfq` stores the declaration, reads the
+   source back from the database, binds the customer from a proven email alias,
+   resolves each line against the catalogue, verifies the claims against the
+   **stored** source, prices, projects the blocking ledger, runs the gate and
+   persists a `DRAFT` — or refuses. Nothing in steps 1–3 can skip, soften or
+   pre-empt any of it, and nothing here approves, sends or transitions a run.
+
+The model therefore never decides SKU identity, pricing, stock, delivery,
+discounts, approval or sending. It proposes claims; the resolver, the verifier,
+the quote engine and the gate decide.
+
+### Supported raw input
+
+The *source grammar is unchanged and deliberately narrow*: it is the closed
+per-line grammar the accepted verifier already enforces, not generational
+natural-language understanding. See
+[`docs/acceptance/README.md`](docs/acceptance/README.md) for the full rules. In
+short, every nonempty body line must be one of:
+
+* `Hello,` / `Hej,` on the first line, and blank lines;
+* `Please quote <n> <unit> of <identifier>` or `We need <n> <unit> of <identifier>`,
+  optionally ending with ` for our standard replenishment` and/or a period;
+* `Please send pricing.` / `No specific delivery date is required.`;
+* `Deliver to <place>` optionally followed by ` on YYYY-MM-DD` or ` by <weekday>`;
+* `Regards,` / `Best regards,` plus one signature that matches the intake sender
+  and the purchasing-role grammar (`Einkauf`, `inköp`, `Procurement`,
+  `Purchasing`).
+
+Units must be an EA spelling (`ea`, `each`, `pc`, `pcs`, `piece`, `pieces`);
+identifiers are 1–64 ASCII alphanumerics with `.`, `_`, `/`, `-`; the subject is
+empty, `RFQ`, or `RFQ: [<n> <unit> ]<identifier>`. Anything else — free prose,
+specifications, corrections, alternatives, pack language, repeated or missing
+requests, attachments, threading — refuses the **whole** quotation and asks for a
+human. That is intentional: an unsupported phrasing must fail closed rather than
+be guessed at.
+
+### What a successful live run prints
+
+```
+Raw RFQ acceptance (live extraction -> accepted engine): northwind-components 2026.10.1
+database: configured database
+input: raw delivery file
+provider: live mode, credentials from the environment
+extraction: openai/gpt-oss-120b - 1 line(s), 0 open question(s), 812 token(s), 640 ms, provider-constrained schema: no
+
+=== fresh RFQ RFQ_1369BB071380D47B
+intake    : run RUN_1369BB071380D47B - rows written
+customer  : EXACT
+line 1    : RESOLVED
+quote     : Q-2026-06268373 (QTE_1369BB071380D47B) - status DRAFT
+money     : 25 x PMP-A-100 @ 1150.0000 EUR = 28750.00
+            subtotal 28750.00 EUR - discount 0.00 = total 28750.00 EUR
+gate      : eligible for human review: YES / awaiting human approval: YES (printed, never stored)
+blocked   : none
+persisted : stored quote QTE_1369BB071380D47B: 1 line(s), 0 blocked reason(s), one transaction
+outcome   : DRAFT_AWAITING_HUMAN_REVIEW
+```
+
+**Honest note on that transcript.** No Groq credential is checked into this
+repository, so the numbers above are the shape a successful run produces, not a
+capture of one. The identical path — same prompt assembly, same schema
+validation, same accepted engine, same rows — is executed offline in
+`tests/acceptance/test_raw_acceptance.py` with the shipped scripted provider, and
+the totals and outcomes there are asserted against the database. To see a real
+provider answer, set `RFQ_LLM_MODE=live` and `RFQ_GROQ__API_KEY`, then run the
+command above; `pytest -m live` runs a single extraction-only smoke test against
+the real model (one small completion, never in CI).
+
+### Safety properties this slice enforces
+
+* **Metadata is never model-controlled.** The model is not sent the sender,
+  subject, identifiers or instants, and a response carrying an unknown field is
+  rejected by a schema with `extra="forbid"`. The stored `rfqs` row is exactly
+  the caller's declaration.
+* **The response cannot become a fact.** Only `accept_rfq` + `to_quote_request` +
+  `verify_extraction_claims` decide whether claims are supported, and they do it
+  against the source re-read from the database with digests re-checked.
+* **Every call is bounded.** `RFQ_GROQ__REQUEST_TIMEOUT_SECONDS`,
+  `RFQ_GROQ__MAX_OUTPUT_TOKENS`, `RFQ_GROQ__MAX_RESPONSE_BYTES` (oversized bodies
+  are refused, not buffered) and `RFQ_GROQ__RETRY__MAX_ATTEMPTS` with capped,
+  jittered backoff. Only the accepted retryable codes are retried; bad output
+  never is.
+* **The transport speaks TLS and verifies the endpoint.** Responses are read
+  through the `ssl.SSLSocket` the handshake produced — never from the descriptor
+  directly — with the system trust store, certificate and hostname verification.
+  An endpoint that cannot prove its identity is a non-retryable refusal, and the
+  request is never written. The one phase the wall-clock deadline cannot
+  interrupt is name resolution: `getaddrinfo` is a blocking libc call, so a slow
+  resolver can overrun the budget (every stdlib client shares this). The deadline
+  is re-checked the moment the connection is established, so an overrun surfaces
+  as `TIMEOUT` instead of being spent on the request.
+* **Live calls need two switches.** `RFQ_LLM_MODE=live` *and* a credential.
+  Default configuration (`llm_mode=replay`) can never reach the network, so the
+  whole offline suite — including every acceptance test — runs against the
+  scripted provider.
+* **Nothing sensitive is printed.** Reports carry identifiers, enum values,
+  counts and amounts. Prompts, response text, bodies, subjects and addresses are
+  not printed, and provider failures are reduced to closed codes; the API key is
+  only ever in an `Authorization` header on an `https://` URL.
+
+Exit codes: `0` for a persisted or duplicated `DRAFT`, `3` when a human must act
+before quoting, `2` for a conflict or an unusable request, `1` when no claim
+reached the engine (provider, timeout, JSON, schema, empty extraction) or the
+run failed — in which case nothing was stored and retrying is safe.
+
+Out of scope for this slice, deliberately: no mailbox integration, no HTTP
+service, no UI, no attachment parsing, no human approval, no outbound sending, no
+schema migration, and no claim of autonomous production deployment. A real
+deployment still needs mailbox ingestion, an operator UI, approval, sending and
+the operational hardening those require.
+
 ## F1/F2 quotation trust boundary
 
 **Business invariant (explicitly approved policy).** `ProductRecord.uom` is the

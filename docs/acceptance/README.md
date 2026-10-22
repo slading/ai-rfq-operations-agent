@@ -1,5 +1,11 @@
 # Fresh RFQ acceptance — runnable demonstration
 
+> For the raw-text path that asks a **real model** for the extraction claims
+> instead of taking them from the declaration, see
+> [`raw-input.md`](raw-input.md) and `python -m rfq_agent.raw_acceptance`. The
+> cases below remain the offline, provider-free reference for the accepted
+> engine's behaviour.
+
 Three declarations, one command, one migrated and seeded database. Each JSON
 file states a complete fresh RFQ: the untrusted source text, the sender, the
 arrival instant, the identifiers only a system may hold, the instant the

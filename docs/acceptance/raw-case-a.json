@@ -1,0 +1,8 @@
+{
+  "body": "Hello,\nplease quote 25 pcs of 100-ABC for our standard replenishment.\nNo specific delivery date is required.\nBest regards,\nNordwind Einkauf",
+  "sender_email": "einkauf@nordwind-industrie.de",
+  "sender_name": "Nordwind Einkauf",
+  "received_at": "2026-10-06T09:00:00Z",
+  "subject": "RFQ: 25 pcs 100-ABC",
+  "source_channel": "EMAIL"
+}
